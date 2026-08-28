@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+config.json
+data/
+logs/
+wechatauto_logs/
+.env
+webui/node_modules/
+webui/.vite/

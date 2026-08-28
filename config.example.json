@@ -1,0 +1,34 @@
+{
+  "timezone": "Asia/Shanghai",
+  "database_path": "data/app.db",
+  "log_path": "logs/app.log",
+  "poll_interval": 1.0,
+  "schedule_poll_seconds": 5.0,
+  "send_verify": true,
+  "duplicate_window_hours": 24,
+  "ai": {
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-5-mini",
+    "api_key_env": "AI_API_KEY",
+    "timeout_seconds": 60,
+    "temperature": 0.1,
+    "max_steps": 10
+  },
+  "defaults": {
+    "history_limit": 30,
+    "aggregation_seconds": 8,
+    "importance_threshold": 70
+  },
+  "groups": [
+    {
+      "id": "需要监听的群名或群聊内部标识",
+      "name": "项目讨论群",
+      "forward_to": [
+        "文件传输助手"
+      ],
+      "system_prompt_file": "prompts/project_group.md",
+      "enabled": true
+    }
+  ]
+}
+
