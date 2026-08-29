@@ -12,7 +12,9 @@
     "api_key_env": "AI_API_KEY",
     "timeout_seconds": 60,
     "temperature": 0.1,
-    "max_steps": 10
+    "max_steps": 10,
+    "verify_ssl": true,
+    "log_requests": false
   },
   "defaults": {
     "history_limit": 30,
@@ -31,4 +33,3 @@
     }
   ]
 }
-

@@ -5,6 +5,8 @@ import hashlib
 import logging
 import queue
 import threading
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -165,6 +167,36 @@ class AgentService:
             self._queue_incoming(group, result["message"])
         logger.info("Clarification id=%s answered by %s and stored in memory", clarification["id"], target)
 
+    def trigger_history_review(self, group_id: str) -> dict[str, Any]:
+        """Persist and immediately queue a trusted request to reassess recent chat history."""
+        with self._config_lock:
+            group = next((item for item in self.config.groups if item.id == group_id), None)
+        if group is None:
+            raise ValueError(f"未配置的群聊：{group_id}")
+        trigger_id = uuid.uuid4().hex
+        payload = {
+            "id": f"manual-review-{trigger_id}",
+            "time": datetime.now().astimezone().isoformat(),
+            "sender": "webui",
+            "sender_name": "WebUI 管理员",
+            "type": "manual_history_review",
+            "content": "管理员要求立即回顾该群最近聊天记录并执行一次完整的重要事件判断。",
+            "direction": "internal",
+            "_internal_trigger": "history_review",
+        }
+        inbox_id, inserted = self.store.save_incoming(group.id, f"manual-review:{trigger_id}", payload)
+        if not inserted:
+            raise RuntimeError("无法创建人工历史回顾任务")
+        payload["_inbox_id"] = inbox_id
+        self._queue_incoming(group, payload, immediate=True)
+        logger.info("Manual history review queued group=%s inbox=%d", group.name, inbox_id)
+        return {
+            "queued": True,
+            "inbox_id": inbox_id,
+            "group_id": group.id,
+            "history_limit": group.history_limit,
+        }
+
     def run_forever(self) -> None:
         self.threads = [
             threading.Thread(target=self._aggregate_loop, name="message-aggregator", daemon=True),
@@ -286,14 +318,17 @@ class AgentService:
         if restored:
             logger.info("Restored %d pending inbox messages", restored)
 
-    def _queue_incoming(self, group: Any, message: dict[str, Any]) -> bool:
+    def _queue_incoming(self, group: Any, message: dict[str, Any], immediate: bool = False) -> bool:
         inbox_id = message.get("_inbox_id")
         if inbox_id is not None:
             with self._active_inbox_lock:
                 if int(inbox_id) in self._active_inbox_ids:
                     return False
                 self._active_inbox_ids.add(int(inbox_id))
-        self.aggregator.submit(group, message)
+        if immediate:
+            self.aggregator.submit_immediate(group, message)
+        else:
+            self.aggregator.submit(group, message)
         return True
 
     def _release_inbox_ids(self, inbox_ids: list[int]) -> None:

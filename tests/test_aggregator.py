@@ -21,6 +21,17 @@ class AggregatorTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in first.messages], [1, 2])
         self.assertEqual([item["id"] for item in second.messages], [3])
 
+    def test_manual_review_is_immediate_and_flushes_buffered_messages(self):
+        group = GroupConfig("g1", "Group", ("target",), aggregation_seconds=60)
+        aggregator = MessageAggregator()
+        stop = threading.Event()
+        aggregator.submit(group, {"id": 1})
+        aggregator.submit_immediate(group, {"id": "manual", "_internal_trigger": "history_review"})
+
+        batch = aggregator.pop_ready(stop)
+
+        self.assertEqual([item["id"] for item in batch.messages], [1, "manual"])
+
 
 if __name__ == "__main__":
     unittest.main()

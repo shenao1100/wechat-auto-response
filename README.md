@@ -22,7 +22,7 @@
 ## 已实现的工具
 
 - `get_chat_history`：最多补取 200 条历史，可用 offset 分页。
-- `get_memory` / `remember`：读取或维护当前群的长期记忆。
+- `get_memory` / `remember`：读取或维护所有监听群共享的长期记忆。
 - `get_recent_forwarded`：检查近期通知，帮助避免语义重复。
 - `schedule_reminder`：创建明确的未来提醒。
 - `list_schedules` / `cancel_schedule`：管理当前群创建的日程。
@@ -52,6 +52,8 @@ Copy-Item config.example.json config.json
 
 - `ai.base_url`：通常以 `/v1` 结尾；程序会追加 `/chat/completions`。
 - `ai.model`：上游实际支持的模型名。
+- `ai.verify_ssl`：默认 `true`；仅在可信网络中排查自签名证书问题时可设为 `false`，此时会关闭 AI 上游 HTTPS 证书校验并输出安全警告。
+- `ai.log_requests`：默认 `false`；设为 `true` 后会把每次发往 AI 上游的完整请求 JSON 写入日志，包括 system、历史、共享记忆、工具定义和 tool results，但不会记录 API Key。日志将包含群聊明文，请谨慎保存。
 - `groups[].id`：传给 wechatauto 的群名或内部 username。
 - `groups[].forward_to`：一个或多个微信联系人。
 - `groups[].system_prompt_file`：相对配置文件所在目录解析。
@@ -92,13 +94,14 @@ python -m wechat_agent.main --config config.json
 
 - 从微信数据库中的完整群聊目录选择监听群，不需要手动输入群标识。
 - 按群配置 `forward_to`、待确认询问对象、重要性阈值和 Prompt。
-- 编辑 Prompt 文件和每个群的长期记忆。
+- 在群规则中点击“立即回顾历史”，可持久化并立即触发一次基于最近聊天记录的完整 Agent 判断流程。
+- 编辑 Prompt 文件和所有群共享的长期记忆。
 - 查看并人工回答待确认事项；答复写入记忆后，运行中的 Agent 会自动取回并重新评估原消息。
 - 查看 Agent 决策、日程和失败队列。
 
 保存监听规则或 Prompt 后会立即热更新：新增或移除群监听、`forward_to`、澄清答复监听、阈值和 Prompt 都无需重启；手工编辑 `config.json` 或当前引用的 Prompt 文件也会在约 1 秒内自动载入。已经进入 Agent 队列的消息继续使用入队时的规则，新消息使用最新规则。
 
-Web 服务默认只监听 `127.0.0.1`，不会直接暴露到局域网。维护场景可用 `--web` 仅启动管理界面（不监听消息），或用 `--agent-only` 仅启动 Agent。
+Web 服务默认只监听 `127.0.0.1`，不会直接暴露到局域网。维护场景可用 `--web-only` 仅启动管理界面（不监听消息），或用 `--agent-only` 仅启动 Agent。为兼容旧命令，`--web` 现在也会启动 Agent 与 WebUI 合并服务。
 
 如果需要修改 Vue 页面：
 
@@ -119,8 +122,8 @@ npm.cmd run build
 # inbox、outbox、逐联系人投递、日程的状态数量
 python -m wechat_agent.main --config config.json --status
 
-# 某个群的长期记忆和全部日程
-python -m wechat_agent.main --config config.json --memory "群聊标识"
+# 所有群共享的长期记忆，以及某个群的日程
+python -m wechat_agent.main --config config.json --memory
 python -m wechat_agent.main --config config.json --schedules "群聊标识"
 
 # 最近 50 次 Agent 运行结果

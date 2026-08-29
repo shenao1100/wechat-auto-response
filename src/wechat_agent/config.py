@@ -36,6 +36,8 @@ def load_config(path: str | Path) -> AppConfig:
         timeout_seconds=float(ai_raw.get("timeout_seconds", 60)),
         temperature=float(ai_raw.get("temperature", 0.1)),
         max_steps=max(1, int(ai_raw.get("max_steps", 10))),
+        verify_ssl=bool(ai_raw.get("verify_ssl", True)),
+        log_requests=bool(ai_raw.get("log_requests", False)),
     )
 
     defaults = raw.get("defaults") or {}

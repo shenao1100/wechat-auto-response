@@ -42,6 +42,15 @@ class MessageAggregator:
                 self._ready.append(MessageBatch(buffer.group, buffer.messages, datetime.now()))
             self._condition.notify_all()
 
+    def submit_immediate(self, group: GroupConfig, message: dict[str, Any]) -> None:
+        """Queue a manual review now, including any messages already buffered for the group."""
+        with self._condition:
+            buffer = self._buffers.pop(group.id, None)
+            messages = list(buffer.messages) if buffer is not None else []
+            messages.append(message)
+            self._ready.append(MessageBatch(group, messages, datetime.now()))
+            self._condition.notify_all()
+
     def pop_ready(self, stop_event: threading.Event) -> MessageBatch | None:
         with self._condition:
             while not stop_event.is_set():

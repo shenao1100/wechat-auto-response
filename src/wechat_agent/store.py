@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+SHARED_MEMORY_SCOPE = "__shared__"
+SHARED_MEMORY_MIGRATION = "shared_memories_v1"
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -64,6 +67,19 @@ class Store:
                 PRAGMA journal_mode=WAL;
                 PRAGMA foreign_keys=ON;
                 CREATE TABLE IF NOT EXISTS memories (
+                    group_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    PRIMARY KEY (group_id, key)
+                );
+                CREATE TABLE IF NOT EXISTS schema_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS memories_group_backup (
                     group_id TEXT NOT NULL,
                     key TEXT NOT NULL,
                     value TEXT NOT NULL,
@@ -183,27 +199,63 @@ class Store:
                         for target in targets
                     ],
                 )
+            self._migrate_shared_memories(connection)
             connection.commit()
         finally:
             connection.close()
 
-    def get_memories(self, group_id: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _migrate_shared_memories(connection: sqlite3.Connection) -> None:
+        migrated = connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key=?",
+            (SHARED_MEMORY_MIGRATION,),
+        ).fetchone()
+        if migrated is not None:
+            return
+        rows = connection.execute(
+            """SELECT group_id, key, value, updated_at, expires_at FROM memories
+               ORDER BY updated_at DESC, CASE WHEN group_id=? THEN 0 ELSE 1 END""",
+            (SHARED_MEMORY_SCOPE,),
+        ).fetchall()
+        connection.executemany(
+            """INSERT OR IGNORE INTO memories_group_backup
+               (group_id, key, value, updated_at, expires_at) VALUES (?, ?, ?, ?, ?)""",
+            [(row["group_id"], row["key"], row["value"], row["updated_at"], row["expires_at"]) for row in rows],
+        )
+        latest_by_key: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            latest_by_key.setdefault(str(row["key"]), row)
+        connection.execute("DELETE FROM memories")
+        connection.executemany(
+            """INSERT INTO memories(group_id, key, value, updated_at, expires_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            [
+                (SHARED_MEMORY_SCOPE, row["key"], row["value"], row["updated_at"], row["expires_at"])
+                for row in latest_by_key.values()
+            ],
+        )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value, updated_at) VALUES (?, ?, ?)",
+            (SHARED_MEMORY_MIGRATION, "completed", iso_utc()),
+        )
+
+    def get_memories(self, _group_id: str = SHARED_MEMORY_SCOPE) -> list[dict[str, Any]]:
         now = iso_utc()
         rows = self._connection().execute(
             """SELECT key, value, updated_at, expires_at FROM memories
                WHERE group_id=? AND (expires_at IS NULL OR expires_at > ?)
                ORDER BY updated_at DESC""",
-            (group_id, now),
+            (SHARED_MEMORY_SCOPE, now),
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def remember(self, group_id: str, key: str, value: str, expires_at: str | None = None) -> None:
+    def remember(self, _group_id: str, key: str, value: str, expires_at: str | None = None) -> None:
         self._connection().execute(
             """INSERT INTO memories(group_id, key, value, updated_at, expires_at)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(group_id, key) DO UPDATE SET
                  value=excluded.value, updated_at=excluded.updated_at, expires_at=excluded.expires_at""",
-            (group_id, key, value, iso_utc(), expires_at),
+            (SHARED_MEMORY_SCOPE, key, value, iso_utc(), expires_at),
         )
 
     def recent_events(self, group_id: str, hours: int, limit: int = 20) -> list[dict[str, Any]]:
@@ -476,7 +528,7 @@ class Store:
                    VALUES (?, ?, ?, ?, NULL)
                    ON CONFLICT(group_id, key) DO UPDATE SET
                      value=excluded.value, updated_at=excluded.updated_at, expires_at=NULL""",
-                (row["group_id"], row["memory_key"], memory_value, now),
+                (SHARED_MEMORY_SCOPE, row["memory_key"], memory_value, now),
             )
             payload = {
                 "id": f"clarification-{clarification_id}",
@@ -502,10 +554,10 @@ class Store:
         payload["_inbox_id"] = int(inbox_row["id"])
         return {"group_id": row["group_id"], "message": payload, "inserted": cursor.rowcount == 1}
 
-    def delete_memory(self, group_id: str, key: str) -> bool:
+    def delete_memory(self, _group_id: str, key: str) -> bool:
         cursor = self._connection().execute(
             "DELETE FROM memories WHERE group_id=? AND key=?",
-            (group_id, key),
+            (SHARED_MEMORY_SCOPE, key),
         )
         return cursor.rowcount == 1
 
@@ -645,7 +697,13 @@ class Store:
             "SELECT status, COUNT(*) AS count FROM clarifications GROUP BY status"
         ).fetchall()
         counts["clarifications"] = {row["status"]: int(row["count"]) for row in clarification_rows}
-        counts["memories"] = int(connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+        counts["memories"] = int(
+            connection.execute(
+                """SELECT COUNT(*) FROM memories
+                   WHERE group_id=? AND (expires_at IS NULL OR expires_at > ?)""",
+                (SHARED_MEMORY_SCOPE, iso_utc()),
+            ).fetchone()[0]
+        )
         counts["agent_runs"] = int(connection.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0])
         return counts
 

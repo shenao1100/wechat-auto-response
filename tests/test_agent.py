@@ -67,6 +67,18 @@ class FakeClient:
         }
 
 
+class CapturingIgnoreClient:
+    def __init__(self):
+        self.messages = None
+
+    def complete(self, messages, tools):
+        self.messages = messages
+        return {
+            "role": "assistant",
+            "content": 'FINAL_DECISION: {"important": false, "forwarded": false, "reason": "历史中没有待处理事件"}',
+        }
+
+
 class AgentTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -114,6 +126,22 @@ class AgentTests(unittest.TestCase):
             'FINAL_DECISION: {"important": false, "forwarded": false, "awaiting_clarification": true, "reason": "等待用户偏好"}'
         )
         self.assertEqual(awaiting["awaiting_clarification"], True)
+
+    def test_manual_history_review_is_a_trusted_agent_task(self):
+        client = CapturingIgnoreClient()
+        runtime = ToolRuntime(self.store, self.gateway, self.outbound.append, "Asia/Shanghai", 24)
+        agent = AgentRunner(client, runtime, self.gateway, self.store, "fake", 3, "Asia/Shanghai", 24)
+        message = {
+            "type": "manual_history_review",
+            "content": "管理员触发",
+            "_internal_trigger": "history_review",
+        }
+
+        outcome = agent.run(MessageBatch(self.group, [message]))
+
+        self.assertEqual(outcome, "ignored")
+        self.assertIn("可信人工历史回顾", client.messages[0]["content"])
+        self.assertIn("人工回顾 recent_history", client.messages[1]["content"])
 
 
 if __name__ == "__main__":

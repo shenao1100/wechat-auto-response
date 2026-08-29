@@ -15,12 +15,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check", action="store_true", help="Validate config without logging into WeChat")
     parser.add_argument("--list-sessions", action="store_true", help="List recent WeChat sessions and exit")
     parser.add_argument("--status", action="store_true", help="Show persistent queue status and exit")
-    parser.add_argument("--memory", metavar="GROUP_ID", help="Show active memory for one group and exit")
+    parser.add_argument("--memory", nargs="?", const="__shared__", metavar="IGNORED_GROUP_ID", help="Show shared active memory and exit")
     parser.add_argument("--schedules", metavar="GROUP_ID", help="Show schedules for one group and exit")
     parser.add_argument("--runs", type=int, nargs="?", const=20, help="Show recent Agent runs and exit")
     parser.add_argument("--failed", action="store_true", help="Show failed inbox/deliveries and exit")
     parser.add_argument("--retry-failed", action="store_true", help="Retry failed inbox and deliveries, then exit")
-    parser.add_argument("--web", action="store_true", help="Start only the local WebUI server (maintenance mode)")
+    parser.add_argument("--web", action="store_true", help="Deprecated compatibility flag; Agent and WebUI are started together by default")
+    parser.add_argument("--web-only", action="store_true", help="Start only the local WebUI server (maintenance mode)")
     parser.add_argument("--agent-only", action="store_true", help="Start the Agent without the embedded WebUI")
     parser.add_argument("--web-host", default="127.0.0.1", help="WebUI bind host")
     parser.add_argument("--web-port", type=int, default=8765, help="WebUI bind port")
@@ -44,7 +45,7 @@ def main() -> int:
         for item in db.get_sessions(limit=200):
             print(item)
         return 0
-    if args.status or args.memory or args.schedules or args.runs is not None or args.failed or args.retry_failed:
+    if args.status or args.memory is not None or args.schedules or args.runs is not None or args.failed or args.retry_failed:
         from .store import Store
 
         store = Store(config.database_path)
@@ -54,7 +55,7 @@ def main() -> int:
                     "inbox_requeued": store.retry_failed_incoming(),
                     "deliveries_requeued": store.retry_failed_deliveries(),
                 }
-            elif args.memory:
+            elif args.memory is not None:
                 result = store.get_memories(args.memory)
             elif args.schedules:
                 result = store.list_schedules(args.schedules, include_done=True)
@@ -68,7 +69,7 @@ def main() -> int:
         finally:
             store.close()
         return 0
-    if args.web:
+    if args.web_only:
         from .web_server import run_web
 
         run_web(args.config, args.web_host, args.web_port)
@@ -84,6 +85,7 @@ def main() -> int:
             args.config,
             service.reload_config,
             service.gateway,  # type: ignore[arg-type]
+            service.trigger_history_review,
             args.web_host,
             args.web_port,
         )

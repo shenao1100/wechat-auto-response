@@ -39,6 +39,8 @@ class ConfigManager:
                 "api_key_env": ai.get("api_key_env", "AI_API_KEY"),
                 "temperature": ai.get("temperature", 0.0),
                 "max_steps": ai.get("max_steps", 10),
+                "verify_ssl": ai.get("verify_ssl", True),
+                "log_requests": ai.get("log_requests", False),
                 "api_key_present": bool(os.environ.get(str(ai.get("api_key_env", "AI_API_KEY")))),
             },
             "defaults": raw.get("defaults") or {},

@@ -31,6 +31,7 @@ def create_app(
     config_path: str = "config.json",
     on_config_changed: Any | None = None,
     gateway: WeChatGateway | None = None,
+    on_manual_trigger: Any | None = None,
 ) -> Any:
     try:
         from fastapi import Body, FastAPI, HTTPException, Query
@@ -75,6 +76,15 @@ def create_app(
         except Exception as exc:
             raise api_error(exc)
 
+    @app.post("/api/groups/{group_id}/evaluate")
+    async def evaluate_group_history(group_id: str) -> dict[str, Any]:
+        if on_manual_trigger is None:
+            raise HTTPException(status_code=409, detail="Agent 服务未在此进程运行，无法触发判断")
+        try:
+            return await asyncio.to_thread(on_manual_trigger, group_id)
+        except Exception as exc:
+            raise api_error(exc)
+
     @app.get("/api/wechat/groups")
     async def wechat_groups() -> list[dict[str, Any]]:
         gateway = await context.gateway()
@@ -90,7 +100,7 @@ def create_app(
         return await asyncio.to_thread(context.store.queue_status)
 
     @app.get("/api/memories")
-    async def memories(group_id: str = Query(...)) -> list[dict[str, Any]]:
+    async def memories(group_id: str = Query(default="__shared__")) -> list[dict[str, Any]]:
         return await asyncio.to_thread(context.store.get_memories, group_id)
 
     @app.put("/api/memories")
@@ -98,7 +108,7 @@ def create_app(
         try:
             await asyncio.to_thread(
                 context.store.remember,
-                str(payload["group_id"]),
+                str(payload.get("group_id") or "__shared__"),
                 str(payload["key"]),
                 str(payload["value"]),
                 payload.get("expires_at"),
@@ -108,7 +118,7 @@ def create_app(
             raise api_error(exc)
 
     @app.delete("/api/memories")
-    async def delete_memory(group_id: str = Query(...), key: str = Query(...)) -> dict[str, Any]:
+    async def delete_memory(group_id: str = Query(default="__shared__"), key: str = Query(...)) -> dict[str, Any]:
         return {"ok": await asyncio.to_thread(context.store.delete_memory, group_id, key)}
 
     @app.get("/api/prompts")
@@ -206,6 +216,7 @@ class EmbeddedWebServer:
         config_path: str,
         on_config_changed: Any,
         gateway: WeChatGateway,
+        on_manual_trigger: Any,
         host: str = "127.0.0.1",
         port: int = 8765,
     ):
@@ -214,7 +225,7 @@ class EmbeddedWebServer:
         except ImportError as exc:
             raise RuntimeError("WebUI requires: python -m pip install -e .[web]") from exc
         uvicorn_config = uvicorn.Config(
-            create_app(config_path, on_config_changed, gateway),
+            create_app(config_path, on_config_changed, gateway, on_manual_trigger),
             host=host,
             port=port,
             log_level="info",

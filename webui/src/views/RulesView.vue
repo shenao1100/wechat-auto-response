@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
 
 const catalog = ref([]), configured = ref([]), prompts = ref([]), selectedId = ref(''), search = ref(''), contactQuery = ref(''), contacts = ref([])
-const loading = ref(true), saving = ref(false), error = ref(''), toast = ref(''), contactTimer = ref(null)
+const loading = ref(true), saving = ref(false), triggering = ref(false), error = ref(''), toast = ref(''), contactTimer = ref(null)
 const selected = computed(() => configured.value.find(g => g.id === selectedId.value))
 const filteredCatalog = computed(() => { const q=search.value.trim().toLowerCase(); return catalog.value.filter(g => !q || `${g.name} ${g.username}`.toLowerCase().includes(q)) })
 
@@ -15,6 +15,7 @@ function removeGroup() { const i=configured.value.findIndex(g=>g.id===selectedId
 function addTarget(contact) { if(selected.value && !selected.value.forward_to.includes(contact.name)) selected.value.forward_to.push(contact.name); contactQuery.value=''; contacts.value=[] }
 function removeTarget(target) { selected.value.forward_to = selected.value.forward_to.filter(item=>item!==target) }
 async function save() { saving.value=true;error.value='';try{const result=await api.saveGroups(configured.value);toast.value=result.hot_reload?.applied?'规则已保存并热更新':'规则已保存';setTimeout(()=>toast.value='',2500)}catch(e){error.value=e.message}finally{saving.value=false} }
+async function triggerReview() { triggering.value=true;error.value='';try{await api.saveGroups(configured.value);const result=await api.evaluateGroup(selected.value.id);toast.value=`已触发 ${selected.value.name} 的历史判断（最近 ${result.history_limit} 条）`;setTimeout(()=>toast.value='',3500)}catch(e){error.value=e.message}finally{triggering.value=false} }
 watch(contactQuery, value => { clearTimeout(contactTimer.value); if(!value.trim()){contacts.value=[];return} contactTimer.value=setTimeout(async()=>{try{contacts.value=(await api.contacts(value)).filter(x=>!x.is_group)}catch(e){error.value=e.message}},250) })
 onMounted(async()=>{try{const [s,g,p]=await Promise.all([api.settings(),api.groups(),api.prompts()]);configured.value=JSON.parse(JSON.stringify(s.groups));catalog.value=g;prompts.value=p;if(configured.value.length)selectedId.value=configured.value[0].id}catch(e){error.value=e.message}finally{loading.value=false}})
 </script>
@@ -38,14 +39,14 @@ onMounted(async()=>{try{const [s,g,p]=await Promise.all([api.settings(),api.grou
         <span class="pill success">{{ configured.length }} 条规则</span>
       </div>
       <div v-if="selected" class="card editor-card">
-        <div class="card-head"><div><h3>③ 规则详情 · {{ selected.name }}</h3><small class="muted mono">{{ selected.id }}</small></div><button class="btn danger small" @click="removeGroup">移除监听</button></div>
+        <div class="card-head"><div><h3>③ 规则详情 · {{ selected.name }}</h3><small class="muted mono">{{ selected.id }}</small></div><div class="actions"><button class="btn small" :disabled="triggering||!selected.forward_to.length" @click="triggerReview">{{ triggering?'正在入队…':'立即回顾历史' }}</button><button class="btn danger small" @click="removeGroup">移除监听</button></div></div>
         <div class="card-body">
           <div class="section-title"><span>A</span><h4>监听行为</h4></div>
-          <div class="form-grid"><div class="field"><label>后台显示名称</label><input v-model="selected.name" class="input" /></div><div class="field"><label>监听状态</label><select v-model="selected.enabled" class="select"><option :value="true">启用</option><option :value="false">停用</option></select></div><div class="field"><label>初始历史条数</label><input v-model.number="selected.history_limit" type="number" min="1" max="200" class="input" /><small>Agent 首次判断随请求携带的最近消息。</small></div><div class="field"><label>消息聚合窗口（秒）</label><input v-model.number="selected.aggregation_seconds" type="number" min="0.1" max="60" step="0.5" class="input" /><small>连续消息会合并成一个事件。</small></div></div>
+          <div class="form-grid"><div class="field"><label>后台显示名称</label><input v-model="selected.name" class="input" /></div><div class="field"><label>监听状态</label><select v-model="selected.enabled" class="select"><option :value="true">启用</option><option :value="false">停用</option></select></div><div class="field"><label>初始历史条数</label><input v-model.number="selected.history_limit" type="number" min="1" max="200" class="input" /><small>实时消息和“立即回顾历史”都会读取这个数量。</small></div><div class="field"><label>消息聚合窗口（秒）</label><input v-model.number="selected.aggregation_seconds" type="number" min="0.1" max="60" step="0.5" class="input" /><small>连续消息会合并成一个事件。</small></div></div>
           <div class="divider"></div><div class="section-title"><span>B</span><h4>转发与澄清链路</h4></div>
           <div class="target-chips"><span v-for="target in selected.forward_to" :key="target">{{ target }}<button @click="removeTarget(target)">×</button></span><em v-if="!selected.forward_to.length">尚未选择 forward_to</em></div>
           <div class="contact-picker"><div class="search"><input v-model="contactQuery" class="input" placeholder="搜索联系人昵称、备注或微信号" /></div><div v-if="contacts.length" class="contact-results"><button v-for="contact in contacts" :key="contact.username" @click="addTarget(contact)"><span>{{ contact.name.slice(0,1) }}</span><div><strong>{{ contact.name }}</strong><small>{{ contact.nickname || contact.username }}</small></div><i>添加</i></button></div></div>
-          <p class="hint">重要摘要和 Agent 的澄清问题都会发往上述联系人。澄清答复将自动写入本群长期记忆。</p>
+          <p class="hint">重要摘要和 Agent 的澄清问题都会发往上述联系人。澄清答复将自动写入所有群共享的长期记忆。</p>
           <div class="divider"></div><div class="section-title"><span>C</span><h4>重要性判断策略</h4></div>
           <div class="form-grid"><div class="field"><label>Prompt 模板</label><select v-model="selected.system_prompt_file" class="select"><option value="">无群专属 Prompt</option><option v-for="prompt in prompts" :key="prompt.name" :value="`prompts/${prompt.name}`">{{ prompt.name }}</option></select><small><RouterLink to="/prompts">前往 Prompt 管理器编辑内容</RouterLink></small></div><div class="field"><label>转发阈值：{{ selected.importance_threshold }}</label><input v-model.number="selected.importance_threshold" type="range" min="0" max="100" class="range" /><small>AI 分数低于阈值时，程序拒绝执行转发。</small></div></div>
         </div>

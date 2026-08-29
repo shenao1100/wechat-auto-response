@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import ssl
 import urllib.error
 import urllib.request
 from typing import Any, Protocol
 
 from .models import AIConfig
+
+logger = logging.getLogger(__name__)
 
 
 class AIError(RuntimeError):
@@ -25,6 +29,13 @@ class OpenAICompatibleClient:
         self.api_key = os.environ.get(config.api_key_env, "")
         if not self.api_key:
             raise AIError(f"Environment variable {config.api_key_env} is not set")
+        self.ssl_context: ssl.SSLContext | None = None
+        if not config.verify_ssl:
+            self.ssl_context = ssl._create_unverified_context()
+            logger.warning(
+                "AI upstream TLS certificate verification is DISABLED for %s; use only with a trusted network/upstream",
+                config.base_url,
+            )
 
     def _endpoint(self) -> str:
         if self.config.base_url.endswith("/chat/completions"):
@@ -39,6 +50,11 @@ class OpenAICompatibleClient:
             "tool_choice": "auto",
             "temperature": self.config.temperature,
         }
+        if self.config.log_requests:
+            logger.info(
+                "Full AI upstream request payload (API key excluded):\n%s",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
         request = urllib.request.Request(
             self._endpoint(),
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -49,7 +65,11 @@ class OpenAICompatibleClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+            with urllib.request.urlopen(
+                request,
+                timeout=self.config.timeout_seconds,
+                context=self.ssl_context,
+            ) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:2000]
@@ -61,4 +81,3 @@ class OpenAICompatibleClient:
             return result["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise AIError(f"Unexpected AI response: {str(result)[:2000]}") from exc
-

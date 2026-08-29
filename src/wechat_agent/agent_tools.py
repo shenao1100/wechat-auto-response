@@ -38,10 +38,10 @@ def tool_definitions() -> list[dict[str, Any]]:
             },
             ["limit"],
         ),
-        tool("get_memory", "读取当前群的长期记忆。", {}, []),
+        tool("get_memory", "读取所有监听群共享的长期记忆。", {}, []),
         tool(
             "remember",
-            "保存对以后判断确实有用且已确认的长期事实。不要保存闲聊或推测。",
+            "保存所有监听群共享、对以后判断确实有用且已确认的长期事实或用户偏好。不要保存闲聊或推测。",
             {
                 "key": {"type": "string"},
                 "value": {"type": "string"},
@@ -67,7 +67,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         ),
         tool(
             "ask_forward_target",
-            "当消息是否重要取决于缺失的用户偏好或背景事实时，向本群配置的 forward_to 发送一个简短问题。问题答案会写入长期记忆并触发重新评估。不要用它询问可从历史消息获取的事实。",
+            "当消息是否重要取决于缺失的用户偏好或背景事实时，向本群配置的 forward_to 发送一个简短问题。问题答案会写入共享长期记忆并触发重新评估。不要用它询问可从历史消息获取的事实。",
             {
                 "question": {"type": "string", "description": "给用户的单一、具体、可直接回答的问题"},
                 "memory_key": {"type": "string", "description": "保存答案的稳定记忆键，如 class.attendance_preference"},

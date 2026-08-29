@@ -76,6 +76,11 @@ class ServiceHotReloadTests(unittest.TestCase):
                 self.assertEqual(service.config.groups[0].importance_threshold, 85)
                 self.assertEqual(service.config.groups[0].forward_to, ("Bob",))
                 self.assertEqual(gateway.reconfigured[-1][0].forward_to, ("Bob",))
+
+                trigger = service.trigger_history_review("group-1")
+                self.assertTrue(trigger["queued"])
+                pending = service.store.pending_incoming()
+                self.assertEqual(pending[-1]["message"]["_internal_trigger"], "history_review")
             finally:
                 service.shutdown()
 

@@ -25,6 +25,8 @@ class AIConfig:
     timeout_seconds: float = 60.0
     temperature: float = 0.1
     max_steps: int = 10
+    verify_ssl: bool = True
+    log_requests: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,4 +61,3 @@ class OutboundMessage:
     targets: tuple[str, ...]
     text: str
     schedule_id: int | None = None
-
