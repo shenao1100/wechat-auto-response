@@ -20,10 +20,18 @@ class ConfigManagerTests(unittest.TestCase):
             manager.replace_groups([{
                 "id": "1@chatroom", "name": "Class", "forward_to": ["Alice"],
                 "system_prompt_file": "prompts/class.md", "enabled": True,
+                "chain": {"enabled": True, "rules": [{
+                    "name": "晚点名", "match_keywords": ["晚点名"],
+                    "exclude_keywords": ["无需接龙"],
+                    "entry_template": "{{profile.dormitory}} {{profile.name}}已返校",
+                    "self_identifiers": ["{{profile.name}}"],
+                }]},
             }])
             raw = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(raw["ai"]["api_key_env"], "SECRET_ENV")
             self.assertEqual(raw["groups"][0]["id"], "1@chatroom")
+            self.assertTrue(raw["groups"][0]["chain"]["enabled"])
+            self.assertEqual(raw["groups"][0]["chain"]["rules"][0]["match_keywords"], ["晚点名"])
 
     def test_prompt_path_traversal_is_rejected(self):
         with tempfile.TemporaryDirectory() as tempdir:

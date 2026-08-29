@@ -6,6 +6,16 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class ChainRuleConfig:
+    name: str
+    match_keywords: tuple[str, ...]
+    exclude_keywords: tuple[str, ...] = ()
+    entry_template: str = ""
+    self_identifiers: tuple[str, ...] = ()
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class GroupConfig:
     id: str
     name: str
@@ -15,6 +25,8 @@ class GroupConfig:
     aggregation_seconds: float = 8.0
     importance_threshold: int = 70
     enabled: bool = True
+    chain_enabled: bool = False
+    chain_rules: tuple[ChainRuleConfig, ...] = ()
 
 
 @dataclass(frozen=True)

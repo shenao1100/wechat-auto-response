@@ -1,6 +1,6 @@
 # 微信群重要信息 Agent
 
-监听指定微信群，将新消息、近期历史、群聊专属提示词和长期记忆交给 OpenAI-compatible 上游。模型可以通过 tool call 获取更长历史、读写记忆、查询近期转发、创建/查看/取消日程以及转发重要信息。
+监听指定微信群，将新消息、近期历史、群聊专属提示词和长期记忆交给 OpenAI-compatible 上游。模型可以通过 tool call 获取更长历史、读写记忆、查询近期转发、创建/查看/取消日程以及转发重要信息。`forward_to` 联系人也可以直接与 Agent 私聊，新增或管理自己的日程和提醒。
 
 ## 运行模型
 
@@ -25,9 +25,13 @@
 - `get_memory` / `remember`：读取或维护所有监听群共享的长期记忆。
 - `get_recent_forwarded`：检查近期通知，帮助避免语义重复。
 - `schedule_reminder`：创建明确的未来提醒。
-- `list_schedules` / `cancel_schedule`：管理当前群创建的日程。
+- `list_schedules` / `cancel_schedule`：管理全局共享日程；所有监听群和 `forward_to` 私聊都能查询或取消同一份日程。
 - `forward_important`：将摘要放入串行微信发送队列，但不终止 Agent。
 - `ask_forward_target`：只有在判断确实缺少用户偏好或背景时，向 `forward_to` 询问；答复会写入长期记忆并触发原消息重新评估。
+- `reply_to_sender`：仅用于 `forward_to` 私聊，回复日程操作结果、普通问答或需要用户补充的信息。
+- `continue_group_chain`：仅处理 WebUI 中为当前群手动启用且关键词匹配的 `#接龙`。发送前读取同主题最新版本，按配置模板生成内容，并通过本人发送方向、完整条目、本人识别标记和本地记录避免重复参与。
+
+`forward_to` 发来的普通私聊会进入独立的私聊 Agent 上下文。时间和事项明确时，Agent 会创建提醒并回复确认；信息不足时会先追问。以 `#澄清编号` 开头或包含该编号的消息优先作为待确认事项的答复处理。Agent 自己发出的私聊回复会按消息方向过滤，不会形成回复循环。
 
 SQLite 保存长期记忆、转发事件、日程、Agent 审计记录以及持久化 inbox/outbox。微信发送始终由一个线程串行执行；每个目标联系人独立记录投递状态，某个联系人失败不会让已经成功的联系人重复收到通知。
 
@@ -57,6 +61,8 @@ Copy-Item config.example.json config.json
 - `groups[].id`：传给 wechatauto 的群名或内部 username。
 - `groups[].forward_to`：一个或多个微信联系人。
 - `groups[].system_prompt_file`：相对配置文件所在目录解析。
+- `groups[].chain.enabled`：是否允许该群自动接龙，默认关闭。
+- `groups[].chain.rules[]`：接龙白名单规则；配置必须包含的关键词、排除关键词、内容模板和本人识别标记。模板使用 `{{memory.key}}` 引用全局共享记忆，缺失时会向 `forward_to` 询问。
 - `importance_threshold`：低于此分数时，程序拒绝执行转发工具。
 
 先检查 JSON 配置：
@@ -124,7 +130,7 @@ python -m wechat_agent.main --config config.json --status
 
 # 所有群共享的长期记忆，以及某个群的日程
 python -m wechat_agent.main --config config.json --memory
-python -m wechat_agent.main --config config.json --schedules "群聊标识"
+python -m wechat_agent.main --config config.json --schedules
 
 # 最近 50 次 Agent 运行结果
 python -m wechat_agent.main --config config.json --runs 50

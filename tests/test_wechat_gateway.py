@@ -5,7 +5,7 @@ import threading
 import zstandard
 
 from wechat_agent.models import GroupConfig
-from wechat_agent.wechat_gateway import WeChatGateway, decode_wechat_content, send_response_accepted
+from wechat_agent.wechat_gateway import WeChatGateway, decode_wechat_content, normalize_message, send_response_accepted
 
 
 class FakeListener:
@@ -19,6 +19,17 @@ class FakeListener:
         self.listeners.remove((user, callback))
 
 
+class FakeContactDB:
+    def search_contact(self, value):
+        return [
+            {"username": "wxid_direct", "nick_name": value, "remark": ""},
+            {"username": "123@chatroom", "nick_name": value, "remark": ""},
+        ]
+
+    def get_nickname(self, value):
+        return value
+
+
 class SendResponseTests(unittest.TestCase):
     def test_ui_sent_but_db_unconfirmed_is_accepted_without_retry(self):
         response = {"status": "失败", "message": "消息已操作发送，但数据库未确认", "data": None}
@@ -30,6 +41,11 @@ class SendResponseTests(unittest.TestCase):
 
 
 class MessageDecodingTests(unittest.TestCase):
+    def test_sort_sequence_is_used_as_history_id_fallback(self):
+        message = normalize_message({"sort_seq": 987654, "content": "notice"})
+
+        self.assertEqual(message["id"], 987654)
+
     def test_zstd_text_restores_sender_and_body(self):
         compressed = zstandard.ZstdCompressor().compress(
             "wxid_sender:\n@所有人 明天十点在 M103 开班会".encode("utf-8")
@@ -56,6 +72,28 @@ class MessageDecodingTests(unittest.TestCase):
 
 
 class SubscriptionTests(unittest.TestCase):
+    def test_ambiguous_name_prefers_single_direct_contact_over_same_named_group(self):
+        gateway = WeChatGateway.__new__(WeChatGateway)
+        gateway.db = FakeContactDB()
+        gateway._resolved_users = {}
+
+        self.assertEqual(gateway.resolve_user("NTG"), "wxid_direct")
+
+    def test_origin_source_distinguishes_private_outgoing_and_incoming_messages(self):
+        gateway = WeChatGateway.__new__(WeChatGateway)
+        gateway.db = FakeContactDB()
+        gateway._sender_names = {}
+
+        outgoing = gateway._normalize_db_message(
+            "wxid_direct", {"local_id": 1, "content": "bot reply", "sender_id": 4, "origin_source": 1}
+        )
+        incoming = gateway._normalize_db_message(
+            "wxid_direct", {"local_id": 2, "content": "user message", "sender_id": 6, "origin_source": 2}
+        )
+
+        self.assertEqual(outgoing["direction"], "self")
+        self.assertEqual(incoming["direction"], "incoming")
+
     def test_reconfigure_resolves_user_before_binding_group_callback(self):
         gateway = WeChatGateway.__new__(WeChatGateway)
         gateway.listener = FakeListener()

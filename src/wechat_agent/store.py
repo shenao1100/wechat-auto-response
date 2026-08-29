@@ -99,6 +99,20 @@ class Store:
                     created_at TEXT NOT NULL,
                     UNIQUE(group_id, fingerprint)
                 );
+                CREATE TABLE IF NOT EXISTS history_read_marks (
+                    group_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    marked_at TEXT NOT NULL,
+                    PRIMARY KEY (group_id, message_id)
+                );
+                CREATE TABLE IF NOT EXISTS chain_participations (
+                    group_id TEXT NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    entry TEXT NOT NULL,
+                    outbox_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (group_id, source_message_id)
+                );
                 CREATE TABLE IF NOT EXISTS schedules (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_id TEXT NOT NULL,
@@ -267,6 +281,36 @@ class Store:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def mark_history_read(self, group_id: str, message_ids: list[Any]) -> tuple[int, int]:
+        normalized = list(dict.fromkeys(str(value).strip() for value in message_ids if str(value).strip()))
+        if not normalized:
+            raise ValueError("message_ids must contain at least one history message id")
+        if len(normalized) > 200:
+            raise ValueError("message_ids cannot contain more than 200 ids")
+        with self.transaction() as connection:
+            before = connection.total_changes
+            connection.executemany(
+                "INSERT OR IGNORE INTO history_read_marks(group_id, message_id, marked_at) VALUES (?, ?, ?)",
+                [(group_id, message_id, iso_utc()) for message_id in normalized],
+            )
+            inserted = connection.total_changes - before
+        return len(normalized), inserted
+
+    def annotate_history(self, group_id: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ids = list(dict.fromkeys(str(item["id"]) for item in messages if item.get("id") is not None))
+        marked: set[str] = set()
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            rows = self._connection().execute(
+                f"SELECT message_id FROM history_read_marks WHERE group_id=? AND message_id IN ({placeholders})",
+                [group_id, *ids],
+            ).fetchall()
+            marked = {str(row["message_id"]) for row in rows}
+        return [
+            {**item, "is_read": item.get("id") is not None and str(item["id"]) in marked}
+            for item in messages
+        ]
+
     def has_recent_event(self, group_id: str, semantic_fingerprint: str, hours: int) -> bool:
         since = iso_utc(utc_now() - timedelta(hours=hours))
         row = self._connection().execute(
@@ -339,6 +383,69 @@ class Store:
             return True, outbox_id
         except sqlite3.IntegrityError:
             return False, None
+
+    def enqueue_message(self, targets: list[str], text: str) -> int:
+        clean_targets = list(dict.fromkeys(str(target).strip() for target in targets if str(target).strip()))
+        clean_text = str(text).strip()
+        if not clean_targets:
+            raise ValueError("targets must not be empty")
+        if not clean_text:
+            raise ValueError("text must not be empty")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "INSERT INTO outbox(targets_json, text, created_at) VALUES (?, ?, ?)",
+                (json.dumps(clean_targets, ensure_ascii=False), clean_text, iso_utc()),
+            )
+            outbox_id = int(cursor.lastrowid)
+            connection.executemany(
+                "INSERT INTO outbox_deliveries(outbox_id, target) VALUES (?, ?)",
+                [(outbox_id, target) for target in clean_targets],
+            )
+        return outbox_id
+
+    def enqueue_chain_participation(
+        self,
+        group_id: str,
+        source_message_id: Any,
+        entry: str,
+        text: str,
+    ) -> tuple[bool, int]:
+        source_key = str(source_message_id).strip()
+        if not source_key:
+            raise ValueError("source_message_id must not be empty")
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT outbox_id FROM chain_participations WHERE group_id=? AND source_message_id=?",
+                (group_id, source_key),
+            ).fetchone()
+            if existing is not None:
+                return False, int(existing["outbox_id"])
+            cursor = connection.execute(
+                "INSERT INTO outbox(targets_json, text, created_at) VALUES (?, ?, ?)",
+                (json.dumps([group_id], ensure_ascii=False), text, iso_utc()),
+            )
+            outbox_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO outbox_deliveries(outbox_id, target) VALUES (?, ?)",
+                (outbox_id, group_id),
+            )
+            connection.execute(
+                """INSERT INTO chain_participations
+                   (group_id, source_message_id, entry, outbox_id, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (group_id, source_key, entry, outbox_id, iso_utc()),
+            )
+        return True, outbox_id
+
+    def has_chain_participation(self, group_id: str, source_message_id: Any) -> bool:
+        source_key = str(source_message_id or "").strip()
+        if not source_key:
+            return False
+        row = self._connection().execute(
+            "SELECT 1 FROM chain_participations WHERE group_id=? AND source_message_id=? LIMIT 1",
+            (group_id, source_key),
+        ).fetchone()
+        return row is not None
 
     def save_incoming(self, group_id: str, message_key: str, payload: dict[str, Any]) -> tuple[int, bool]:
         cursor = self._connection().execute(
@@ -717,12 +824,14 @@ class Store:
     def failed_items(self, limit: int = 100) -> dict[str, list[dict[str, Any]]]:
         connection = self._connection()
         inbox = connection.execute(
-            """SELECT id, group_id, received_at, last_error FROM inbox
+            """SELECT id, group_id, message_key, payload_json, status,
+                      received_at, finished_at, last_error FROM inbox
                WHERE status='failed' ORDER BY id DESC LIMIT ?""",
             (limit,),
         ).fetchall()
         deliveries = connection.execute(
-            """SELECT d.id, d.outbox_id, d.target, d.attempts, d.last_error, o.created_at
+            """SELECT d.id, d.outbox_id, d.target, d.status, d.attempts,
+                      d.sent_at, d.last_error, o.text, o.created_at
                FROM outbox_deliveries d JOIN outbox o ON o.id=d.outbox_id
                WHERE d.status='failed' ORDER BY d.id DESC LIMIT ?""",
             (limit,),
@@ -747,28 +856,28 @@ class Store:
         )
         return int(cursor.lastrowid)
 
-    def find_schedule(self, group_id: str, title: str, content: str, run_at: str) -> int | None:
+    def find_schedule(self, _group_id: str, title: str, content: str, run_at: str) -> int | None:
         row = self._connection().execute(
             """SELECT id FROM schedules
-               WHERE group_id=? AND title=? AND content=? AND run_at=? AND status!='cancelled'
+               WHERE title=? AND content=? AND run_at=? AND status!='cancelled'
                ORDER BY id DESC LIMIT 1""",
-            (group_id, title, content, run_at),
+            (title, content, run_at),
         ).fetchone()
         return int(row["id"]) if row else None
 
-    def list_schedules(self, group_id: str, include_done: bool = False) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM schedules WHERE group_id=?"
-        params: list[Any] = [group_id]
+    def list_schedules(self, _group_id: str | None = None, include_done: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM schedules WHERE 1=1"
+        params: list[Any] = []
         if not include_done:
             sql += " AND status IN ('pending', 'sending')"
         sql += " ORDER BY run_at ASC LIMIT 100"
         rows = self._connection().execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
-    def cancel_schedule(self, group_id: str, schedule_id: int) -> bool:
+    def cancel_schedule(self, _group_id: str | None, schedule_id: int) -> bool:
         cursor = self._connection().execute(
-            "UPDATE schedules SET status='cancelled' WHERE id=? AND group_id=? AND status='pending'",
-            (schedule_id, group_id),
+            "UPDATE schedules SET status='cancelled' WHERE id=? AND status='pending'",
+            (schedule_id,),
         )
         return cursor.rowcount == 1
 

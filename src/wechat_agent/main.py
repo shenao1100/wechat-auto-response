@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-sessions", action="store_true", help="List recent WeChat sessions and exit")
     parser.add_argument("--status", action="store_true", help="Show persistent queue status and exit")
     parser.add_argument("--memory", nargs="?", const="__shared__", metavar="IGNORED_GROUP_ID", help="Show shared active memory and exit")
-    parser.add_argument("--schedules", metavar="GROUP_ID", help="Show schedules for one group and exit")
+    parser.add_argument("--schedules", nargs="?", const="__all__", metavar="IGNORED_GROUP_ID", help="Show global schedules and exit")
     parser.add_argument("--runs", type=int, nargs="?", const=20, help="Show recent Agent runs and exit")
     parser.add_argument("--failed", action="store_true", help="Show failed inbox/deliveries and exit")
     parser.add_argument("--retry-failed", action="store_true", help="Retry failed inbox and deliveries, then exit")
@@ -29,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     args = build_parser().parse_args()
     try:
         config = load_config(args.config)
@@ -45,7 +47,7 @@ def main() -> int:
         for item in db.get_sessions(limit=200):
             print(item)
         return 0
-    if args.status or args.memory is not None or args.schedules or args.runs is not None or args.failed or args.retry_failed:
+    if args.status or args.memory is not None or args.schedules is not None or args.runs is not None or args.failed or args.retry_failed:
         from .store import Store
 
         store = Store(config.database_path)
@@ -57,8 +59,8 @@ def main() -> int:
                 }
             elif args.memory is not None:
                 result = store.get_memories(args.memory)
-            elif args.schedules:
-                result = store.list_schedules(args.schedules, include_done=True)
+            elif args.schedules is not None:
+                result = store.list_schedules(None, include_done=True)
             elif args.runs is not None:
                 result = store.recent_runs(max(1, min(500, args.runs)))
             elif args.failed:

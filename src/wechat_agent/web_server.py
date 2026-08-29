@@ -166,8 +166,8 @@ def create_app(
             raise api_error(exc)
 
     @app.get("/api/schedules")
-    async def schedules(group_id: str = Query(...)) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(context.store.list_schedules, group_id, True)
+    async def schedules() -> list[dict[str, Any]]:
+        return await asyncio.to_thread(context.store.list_schedules, None, True)
 
     @app.get("/api/runs")
     async def runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict[str, Any]]:

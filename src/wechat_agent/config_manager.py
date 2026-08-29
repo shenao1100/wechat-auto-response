@@ -68,6 +68,29 @@ class ConfigManager:
                 if not prompt_path.is_file():
                     raise ValueError(f"Prompt file not found: {prompt_name}")
                 prompt_file = f"prompts/{prompt_name}"
+            chain = item.get("chain") or {}
+            clean_chain_rules: list[dict[str, Any]] = []
+            for rule_index, rule in enumerate(chain.get("rules") or []):
+                keywords = list(dict.fromkeys(
+                    str(value).strip() for value in rule.get("match_keywords") or [] if str(value).strip()
+                ))
+                template = str(rule.get("entry_template") or "").strip()
+                if not keywords:
+                    raise ValueError(f"Chain rule {rule_index + 1} in {name} requires match_keywords")
+                if not template:
+                    raise ValueError(f"Chain rule {rule_index + 1} in {name} requires entry_template")
+                clean_chain_rules.append({
+                    "name": str(rule.get("name") or f"接龙规则 {rule_index + 1}").strip()[:100],
+                    "enabled": bool(rule.get("enabled", True)),
+                    "match_keywords": keywords[:20],
+                    "exclude_keywords": list(dict.fromkeys(
+                        str(value).strip() for value in rule.get("exclude_keywords") or [] if str(value).strip()
+                    ))[:20],
+                    "entry_template": template[:1000],
+                    "self_identifiers": list(dict.fromkeys(
+                        str(value).strip() for value in rule.get("self_identifiers") or [] if str(value).strip()
+                    ))[:20],
+                })
             clean_groups.append(
                 {
                     "id": group_id,
@@ -78,6 +101,10 @@ class ConfigManager:
                     "history_limit": max(1, min(200, int(item.get("history_limit", 30)))),
                     "aggregation_seconds": max(0.1, min(60, float(item.get("aggregation_seconds", 8)))),
                     "importance_threshold": max(0, min(100, int(item.get("importance_threshold", 70)))),
+                    "chain": {
+                        "enabled": bool(chain.get("enabled", False)),
+                        "rules": clean_chain_rules,
+                    },
                 }
             )
         with self._lock:

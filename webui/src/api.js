@@ -35,7 +35,7 @@ export const api = {
   deleteMemory: (key) => request(`/api/memories?key=${encodeURIComponent(key)}`, { method: 'DELETE' }),
   clarifications: (status = '') => request(`/api/clarifications${status ? `?status=${status}` : ''}`),
   answerClarification: (id, answer) => request(`/api/clarifications/${id}/answer`, { method: 'POST', body: JSON.stringify({ answer }) }),
-  schedules: (groupId) => request(`/api/schedules?group_id=${encodeURIComponent(groupId)}`),
+  schedules: () => request('/api/schedules'),
   runs: (limit = 50) => request(`/api/runs?limit=${limit}`),
   failed: () => request('/api/failed'),
   retryFailed: () => request('/api/failed/retry', { method: 'POST' }),

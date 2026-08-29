@@ -34,6 +34,20 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(schedules[0]["id"], schedule_id)
         self.assertEqual(schedules[0]["status"], "sent")
 
+    def test_schedules_are_global_across_conversations(self):
+        run_at = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        schedule_id = self.store.add_schedule("group-a", "Global event", "Bring materials", run_at, ["Alice"])
+
+        visible_from_direct_chat = self.store.list_schedules("Alice")
+        duplicate_from_other_group = self.store.find_schedule("group-b", "Global event", "Bring materials", run_at)
+        cancelled_from_other_group = self.store.cancel_schedule("group-b", schedule_id)
+
+        self.assertEqual(visible_from_direct_chat[0]["id"], schedule_id)
+        self.assertEqual(visible_from_direct_chat[0]["group_id"], "group-a")
+        self.assertEqual(duplicate_from_other_group, schedule_id)
+        self.assertTrue(cancelled_from_other_group)
+        self.assertEqual(self.store.list_schedules(None, include_done=True)[0]["status"], "cancelled")
+
     def test_inbox_survives_and_can_be_retried(self):
         inbox_id, inserted = self.store.save_incoming("g1", "m1", {"content": "hello"})
         self.assertTrue(inserted)
@@ -46,6 +60,22 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(self.store.failed_items()["inbox"]), 1)
         self.assertEqual(self.store.retry_failed_incoming(), 1)
         self.assertEqual(len(self.store.pending_incoming()), 1)
+
+    def test_history_read_marks_are_scoped_by_group_and_annotated(self):
+        messages = [{"id": 10, "content": "notice"}, {"id": 11, "content": "follow-up"}]
+        self.assertEqual(
+            [item["is_read"] for item in self.store.annotate_history("g1", messages)],
+            [False, False],
+        )
+
+        requested, inserted = self.store.mark_history_read("g1", [10, "10"])
+
+        self.assertEqual((requested, inserted), (1, 1))
+        self.assertEqual(
+            [item["is_read"] for item in self.store.annotate_history("g1", messages)],
+            [True, False],
+        )
+        self.assertFalse(self.store.annotate_history("g2", messages)[0]["is_read"])
 
     def test_each_outbox_target_has_independent_delivery_state(self):
         inserted, outbox_id = self.store.record_event_and_enqueue(
@@ -64,6 +94,23 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.retry_failed_deliveries(), 1)
         retried = self.store.claim_delivery()
         self.assertEqual(retried["target"], "Bob")
+
+    def test_direct_reply_is_persisted_in_reliable_outbox(self):
+        outbox_id = self.store.enqueue_message(["Alice"], "Schedule created")
+
+        delivery = self.store.claim_delivery()
+        self.assertEqual(delivery["outbox_id"], outbox_id)
+        self.assertEqual(delivery["target"], "Alice")
+        self.assertEqual(delivery["text"], "Schedule created")
+
+    def test_chain_participation_is_idempotent_for_latest_source_message(self):
+        first = self.store.enqueue_chain_participation("g@chatroom", 12, "505 4/4", "#接龙\n1. 505 4/4")
+        duplicate = self.store.enqueue_chain_participation("g@chatroom", "12", "505 4/4", "duplicate")
+
+        self.assertTrue(first[0])
+        self.assertFalse(duplicate[0])
+        self.assertEqual(first[1], duplicate[1])
+        self.assertEqual(self.store.claim_delivery()["text"], "#接龙\n1. 505 4/4")
 
     def test_clarification_is_idempotent_and_answer_becomes_memory_and_inbox(self):
         context = [{"content": "是否参加可选活动？"}]

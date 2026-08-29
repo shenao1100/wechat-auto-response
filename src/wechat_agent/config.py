@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .models import AIConfig, AppConfig, GroupConfig
+from .models import AIConfig, AppConfig, ChainRuleConfig, GroupConfig
 
 
 class ConfigError(ValueError):
@@ -54,6 +54,36 @@ def load_config(path: str | Path) -> AppConfig:
         targets = tuple(dict.fromkeys(str(x).strip() for x in (item.get("forward_to") or []) if str(x).strip()))
         if not targets:
             raise ConfigError(f"{location}.forward_to must not be empty")
+        chain_raw = item.get("chain") or {}
+        chain_rules: list[ChainRuleConfig] = []
+        for rule_index, rule in enumerate(chain_raw.get("rules") or []):
+            rule_location = f"{location}.chain.rules[{rule_index}]"
+            keywords = tuple(
+                dict.fromkeys(str(value).strip() for value in rule.get("match_keywords") or [] if str(value).strip())
+            )
+            template = str(rule.get("entry_template") or "").strip()
+            if not keywords:
+                raise ConfigError(f"{rule_location}.match_keywords must not be empty")
+            if not template:
+                raise ConfigError(f"{rule_location}.entry_template must not be empty")
+            chain_rules.append(
+                ChainRuleConfig(
+                    name=str(rule.get("name") or f"接龙规则 {rule_index + 1}"),
+                    match_keywords=keywords,
+                    exclude_keywords=tuple(
+                        dict.fromkeys(
+                            str(value).strip() for value in rule.get("exclude_keywords") or [] if str(value).strip()
+                        )
+                    ),
+                    entry_template=template,
+                    self_identifiers=tuple(
+                        dict.fromkeys(
+                            str(value).strip() for value in rule.get("self_identifiers") or [] if str(value).strip()
+                        )
+                    ),
+                    enabled=bool(rule.get("enabled", True)),
+                )
+            )
         groups.append(
             GroupConfig(
                 id=str(_require(item, "id", location)),
@@ -70,6 +100,8 @@ def load_config(path: str | Path) -> AppConfig:
                     min(100, int(item.get("importance_threshold", defaults.get("importance_threshold", 70)))),
                 ),
                 enabled=bool(item.get("enabled", True)),
+                chain_enabled=bool(chain_raw.get("enabled", False)),
+                chain_rules=tuple(chain_rules),
             )
         )
     if not groups:

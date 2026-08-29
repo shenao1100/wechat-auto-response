@@ -6,10 +6,66 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from .models import GroupConfig, MessageBatch, OutboundMessage, ToolExecution
+from .models import ChainRuleConfig, GroupConfig, MessageBatch, OutboundMessage, ToolExecution
 from .store import Store
 from .timeutils import get_timezone
 from .wechat_gateway import Gateway
+
+
+def parse_chain_message(content: Any) -> dict[str, Any] | None:
+    text = str(content or "")
+    marker = text.find("#接龙")
+    if marker < 0:
+        return None
+    chain_text = text[marker:].strip()
+    lines = chain_text.splitlines()
+    title = next((line.strip() for line in lines[1:] if line.strip()), "#接龙")
+    entries = []
+    for line in lines:
+        match = re.match(r"^\s*(\d+)\s*[.．、]\s*(.+?)\s*$", line)
+        if match:
+            entries.append({"number": int(match.group(1)), "content": match.group(2).strip()})
+    return {"text": chain_text, "title": title, "entries": entries}
+
+
+def match_chain_rule(group: GroupConfig, chain: dict[str, Any]) -> ChainRuleConfig | None:
+    if not group.chain_enabled:
+        return None
+    haystack = re.sub(r"\s+", " ", str(chain.get("text") or "")).casefold()
+    for rule in group.chain_rules:
+        includes = [value.casefold() for value in rule.match_keywords]
+        excludes = [value.casefold() for value in rule.exclude_keywords]
+        if rule.enabled and includes and all(value in haystack for value in includes) and not any(
+            value in haystack for value in excludes
+        ):
+            return rule
+    return None
+
+
+_MEMORY_PLACEHOLDER = re.compile(r"{{\s*([^{}]+?)\s*}}")
+
+
+def render_chain_rule(
+    rule: ChainRuleConfig,
+    memories: list[dict[str, Any]],
+) -> tuple[str | None, tuple[str, ...], tuple[str, ...]]:
+    values = {str(item.get("key")): str(item.get("value") or "") for item in memories}
+    missing: list[str] = []
+
+    def render(value: str) -> str:
+        def replace(match: re.Match[str]) -> str:
+            key = match.group(1).strip()
+            if not values.get(key):
+                missing.append(key)
+                return ""
+            return values[key]
+
+        return _MEMORY_PLACEHOLDER.sub(replace, value).strip()
+
+    entry = render(rule.entry_template)
+    identifiers = tuple(value for value in (render(item) for item in rule.self_identifiers) if value)
+    missing_keys = tuple(dict.fromkeys(missing))
+    return (entry if entry and not missing_keys else None), identifiers, missing_keys
 
 
 def tool_definitions() -> list[dict[str, Any]]:
@@ -75,10 +131,10 @@ def tool_definitions() -> list[dict[str, Any]]:
             },
             ["question", "memory_key"],
         ),
-        tool("list_schedules", "查看当前群聊创建的待执行日程。", {}, []),
+        tool("list_schedules", "查看全局待执行日程。所有监听群和 forward_to 私聊共享同一份日程列表。", {}, []),
         tool(
             "cancel_schedule",
-            "取消当前群聊创建的待执行日程。",
+            "按日程 ID 取消全局待执行日程，不受当前对话限制。",
             {"schedule_id": {"type": "integer"}},
             ["schedule_id"],
         ),
@@ -96,6 +152,33 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "event_time": {"type": ["string", "null"]},
             },
             ["title", "summary", "category", "importance_score", "reason", "action_required"],
+        ),
+        tool(
+            "mark_history_read",
+            "仅在重要信息已通过 forward_important 进入转发流程后调用。按 recent_history/get_chat_history 中的 id 标记构成该事件的历史消息，之后这些消息会以 is_read=true 发送给上游。",
+            {
+                "message_ids": {
+                    "type": "array",
+                    "items": {"type": ["integer", "string"]},
+                    "minItems": 1,
+                    "maxItems": 200,
+                }
+            },
+            ["message_ids"],
+        ),
+        tool(
+            "reply_to_sender",
+            "仅用于 forward_to 私聊模式。向当前私聊发送者回复结果、日程确认或需要补充的信息；调用后仍需输出规定的最终回复。",
+            {"text": {"type": "string", "description": "简洁、自然且包含必要结果的回复正文"}},
+            ["text"],
+        ),
+        tool(
+            "continue_group_chain",
+            "按当前群手动配置的接龙规则参与 #接龙。程序会重新读取最新版本、检测本人是否已经参与、按配置模板生成内容、自动编号并持久化去重。",
+            {
+                "source_message_id": {"type": ["integer", "string"], "description": "包含 #接龙 的历史消息 id"},
+            },
+            ["source_message_id"],
         ),
     ]
 
@@ -126,6 +209,9 @@ class ToolRuntime:
             "list_schedules": self._list_schedules,
             "cancel_schedule": self._cancel_schedule,
             "forward_important": self._forward_important,
+            "mark_history_read": self._mark_history_read,
+            "reply_to_sender": self._reply_to_sender,
+            "continue_group_chain": self._continue_group_chain,
         }
         handler = handlers.get(name)
         if handler is None:
@@ -139,6 +225,7 @@ class ToolRuntime:
         limit = min(200, max(1, int(args["limit"])))
         offset = max(0, int(args.get("offset", 0)))
         history = self.gateway.get_history(batch.group.id, limit, offset)
+        history = self.store.annotate_history(batch.group.id, history)
         return ToolExecution({"ok": True, "messages": history, "count": len(history)})
 
     def _get_memory(self, _args: dict[str, Any], batch: MessageBatch) -> ToolExecution:
@@ -180,7 +267,7 @@ class ToolRuntime:
     def _list_schedules(self, _args: dict[str, Any], batch: MessageBatch) -> ToolExecution:
         schedules = self.store.list_schedules(batch.group.id)
         for item in schedules:
-            item.pop("targets_json", None)
+            item["targets"] = json.loads(item.pop("targets_json", "[]"))
         return ToolExecution({"ok": True, "schedules": schedules})
 
     def _ask_forward_target(self, args: dict[str, Any], batch: MessageBatch) -> ToolExecution:
@@ -241,6 +328,111 @@ class ToolRuntime:
 
         self.enqueue_outbound(OutboundMessage(batch.group.forward_to, text))
         return ToolExecution({"ok": True, "queued": True, "outbox_id": outbox_id})
+
+    def _mark_history_read(self, args: dict[str, Any], batch: MessageBatch) -> ToolExecution:
+        message_ids = args.get("message_ids")
+        if not isinstance(message_ids, list):
+            raise ValueError("message_ids must be an array")
+        requested, newly_marked = self.store.mark_history_read(batch.group.id, message_ids)
+        return ToolExecution(
+            {"ok": True, "marked": requested, "newly_marked": newly_marked, "message_ids": message_ids}
+        )
+
+    def _reply_to_sender(self, args: dict[str, Any], batch: MessageBatch) -> ToolExecution:
+        target = next(
+            (str(message.get("_direct_target") or "").strip() for message in batch.messages if message.get("_direct_target")),
+            "",
+        )
+        if not target:
+            raise ValueError("reply_to_sender is only available for forward_to direct chats")
+        text = str(args.get("text") or "").strip()[:4000]
+        if not text:
+            raise ValueError("text must not be empty")
+        outbox_id = self.store.enqueue_message([target], text)
+        self.enqueue_outbound(OutboundMessage((target,), text))
+        return ToolExecution({"ok": True, "queued": True, "outbox_id": outbox_id, "target": target})
+
+    def _continue_group_chain(self, args: dict[str, Any], batch: MessageBatch) -> ToolExecution:
+        if not batch.group.id.endswith("@chatroom"):
+            raise ValueError("continue_group_chain is only available in a configured group chat")
+        requested_id = str(args.get("source_message_id") or "").strip()
+        if not requested_id:
+            raise ValueError("source_message_id must not be empty")
+
+        history = self.gateway.get_history(batch.group.id, 200)
+        requested = next((item for item in history if str(item.get("id")) == requested_id), None)
+        requested_chain = parse_chain_message(requested.get("content")) if requested else None
+        if requested_chain is None:
+            raise ValueError("source_message_id does not identify a #接龙 message in recent history")
+        rule = match_chain_rule(batch.group, requested_chain)
+        if rule is None:
+            return ToolExecution({"ok": False, "error": "This chain does not match any enabled rule"})
+        entry, self_identifiers, missing = render_chain_rule(rule, self.store.get_memories(batch.group.id))
+        if missing:
+            return ToolExecution({"ok": False, "error": "Missing required shared memory", "missing_memory_keys": missing})
+        if not entry:
+            return ToolExecution({"ok": False, "error": "The configured entry template rendered as empty"})
+        entry = " ".join(entry.splitlines()).strip()[:500]
+        if "#接龙" in entry:
+            raise ValueError("Configured entry template must render to one entry, not a chain")
+
+        topic = re.sub(r"\s+", "", requested_chain["title"]).casefold()
+        candidates = []
+        for item in history:
+            parsed = parse_chain_message(item.get("content"))
+            if parsed and re.sub(r"\s+", "", parsed["title"]).casefold() == topic:
+                candidates.append((item, parsed))
+        latest, latest_chain = candidates[-1]
+        latest_rule = match_chain_rule(batch.group, latest_chain)
+        if latest_rule != rule:
+            return ToolExecution({"ok": False, "error": "The latest chain version no longer matches this rule"})
+        normalized_entry = re.sub(r"\s+", "", entry).casefold()
+        normalized_identifiers = [re.sub(r"\s+", "", value).casefold() for value in self_identifiers]
+        existing_entries = [re.sub(r"\s+", "", item["content"]).casefold() for item in latest_chain["entries"]]
+        sent_by_self = str(latest.get("direction") or "").casefold() in {"self", "outgoing", "sent"}
+        identity_found = bool(normalized_identifiers) and any(
+            all(identifier in existing for identifier in normalized_identifiers) for existing in existing_entries
+        )
+        locally_recorded = self.store.has_chain_participation(batch.group.id, latest.get("id"))
+        if sent_by_self or locally_recorded or normalized_entry in existing_entries or identity_found:
+            return ToolExecution(
+                {
+                    "ok": True,
+                    "already_joined": True,
+                    "latest_message_id": latest.get("id"),
+                    "entry": entry,
+                    "rule": rule.name,
+                    "matched_by": (
+                        "outgoing_message" if sent_by_self else "local_record" if locally_recorded
+                        else "exact_entry" if normalized_entry in existing_entries else "self_identifiers"
+                    ),
+                }
+            )
+
+        next_number = max((item["number"] for item in latest_chain["entries"]), default=0) + 1
+        outgoing = f"{latest_chain['text'].rstrip()}\n{next_number}. {entry}"
+        inserted, outbox_id = self.store.enqueue_chain_participation(
+            batch.group.id,
+            latest.get("id"),
+            entry,
+            outgoing,
+        )
+        if latest.get("id") is not None:
+            self.store.mark_history_read(batch.group.id, [latest["id"]])
+        if inserted:
+            self.enqueue_outbound(OutboundMessage((batch.group.id,), outgoing))
+        return ToolExecution(
+            {
+                "ok": True,
+                "queued": inserted,
+                "duplicate": not inserted,
+                "outbox_id": outbox_id,
+                "latest_message_id": latest.get("id"),
+                "number": next_number,
+                "entry": entry,
+                "rule": rule.name,
+            }
+        )
 
     def _parse_time(self, value: str) -> datetime:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))

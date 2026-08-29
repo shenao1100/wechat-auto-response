@@ -4,6 +4,7 @@ import json
 import hashlib
 import logging
 import queue
+import re
 import threading
 import uuid
 from datetime import datetime
@@ -157,15 +158,46 @@ class AgentService:
         if message.get("direction") == "self":
             return
         content = str(message.get("content") or "").strip()
-        clarification = self.store.find_clarification_for_reply(target, content)
-        if clarification is None:
-            logger.debug("Direct message from %s did not match a pending clarification", target)
+        clarification = self.store.find_clarification_for_reply(target, content) if re.search(r"#\s*\d+", content) else None
+        if clarification is not None:
+            result = self.store.answer_clarification(int(clarification["id"]), content, target)
+            group = next((item for item in self.config.groups if item.id == result["group_id"]), None)
+            if group is not None and result["inserted"]:
+                self._queue_incoming(group, result["message"])
+            logger.info("Clarification id=%s answered by %s and stored in memory", clarification["id"], target)
             return
-        result = self.store.answer_clarification(int(clarification["id"]), content, target)
-        group = next((item for item in self.config.groups if item.id == result["group_id"]), None)
-        if group is not None and result["inserted"]:
-            self._queue_incoming(group, result["message"])
-        logger.info("Clarification id=%s answered by %s and stored in memory", clarification["id"], target)
+
+        direct_group = self._direct_group(target)
+        raw_key = message.get("id")
+        if raw_key is None:
+            serialized = json.dumps(message, ensure_ascii=False, sort_keys=True)
+            raw_key = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        else:
+            raw_key = f"{raw_key}:{message.get('time') or ''}"
+        payload = dict(message)
+        payload["_direct_chat"] = True
+        payload["_direct_target"] = target
+        inbox_id, inserted = self.store.save_incoming(direct_group.id, f"direct:{raw_key}", payload)
+        if not inserted:
+            logger.debug("Ignored duplicate direct message target=%s key=%s", target, raw_key)
+            return
+        payload["_inbox_id"] = inbox_id
+        self._queue_incoming(direct_group, payload)
+        logger.info("New direct chat message from forward_to=%s", target)
+
+    @staticmethod
+    def _direct_group(target: str) -> Any:
+        from .models import GroupConfig
+
+        return GroupConfig(
+            id=target,
+            name=f"私聊 · {target}",
+            forward_to=(target,),
+            system_prompt="forward_to 私聊是受信任的用户对话。帮助用户管理日程、提醒和共享长期记忆，并明确回复操作结果。",
+            history_limit=30,
+            aggregation_seconds=1.0,
+            importance_threshold=0,
+        )
 
     def trigger_history_review(self, group_id: str) -> dict[str, Any]:
         """Persist and immediately queue a trusted request to reassess recent chat history."""
@@ -258,7 +290,10 @@ class AgentService:
             inbox_ids = [int(message["_inbox_id"]) for message in batch.messages if message.get("_inbox_id") is not None]
             try:
                 outcome = self.agent.run(batch)
-                success = outcome in {"important", "ignored", "awaiting_clarification"}
+                success = outcome in {
+                    "important", "ignored", "awaiting_clarification", "direct_chat",
+                    "chain_joined", "chain_already_joined",
+                }
                 self.store.finish_incoming(inbox_ids, success, None if success else outcome)
                 self._release_inbox_ids(inbox_ids)
             except Exception as exc:
@@ -307,6 +342,8 @@ class AgentService:
 
     def _restore_pending_incoming(self) -> None:
         groups = {group.id: group for group in self.config.groups if group.enabled}
+        for target in dict.fromkeys(target for group in self.config.groups if group.enabled for target in group.forward_to):
+            groups.setdefault(target, self._direct_group(target))
         restored = 0
         for item in self.store.pending_incoming():
             group = groups.get(item["group_id"])

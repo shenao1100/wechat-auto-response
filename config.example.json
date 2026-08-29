@@ -29,7 +29,20 @@
         "文件传输助手"
       ],
       "system_prompt_file": "prompts/project_group.md",
-      "enabled": true
+      "enabled": true,
+      "chain": {
+        "enabled": false,
+        "rules": [
+          {
+            "name": "宿舍晚点名",
+            "enabled": true,
+            "match_keywords": ["晚点名", "宿舍"],
+            "exclude_keywords": ["无需接龙"],
+            "entry_template": "{{profile.dormitory}} {{profile.name}}已返校",
+            "self_identifiers": ["{{profile.name}}"]
+          }
+        ]
+      }
     }
   ]
 }

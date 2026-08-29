@@ -138,7 +138,7 @@ def normalize_message(message: Any) -> dict[str, Any]:
         data = {"content": str(message)}
     safe = _json_safe(data)
     return {
-        "id": safe.get("local_id") or safe.get("id") or safe.get("msg_id"),
+        "id": safe.get("local_id") or safe.get("id") or safe.get("msg_id") or safe.get("sort_seq"),
         "time": safe.get("create_time") or safe.get("time") or safe.get("timestamp"),
         "sender": safe.get("sender_username") or safe.get("sender") or safe.get("sender_id"),
         "sender_name": safe.get("sender_name") or safe.get("nickname"),
@@ -204,7 +204,17 @@ class WeChatGateway:
             item for item in hits
             if value in {str(item.get("username") or ""), str(item.get("remark") or ""), str(item.get("nick_name") or "")}
         ]
-        resolved = str(exact[0]["username"]) if len(exact) == 1 else value
+        username_matches = [item for item in exact if str(item.get("username") or "") == value]
+        direct_matches = [item for item in exact if not str(item.get("username") or "").endswith("@chatroom")]
+        if len(username_matches) == 1:
+            resolved = str(username_matches[0]["username"])
+        elif not value.endswith("@chatroom") and len(direct_matches) == 1:
+            resolved = str(direct_matches[0]["username"])
+            logger.info("Resolved ambiguous contact name %s to direct user %s", value, resolved)
+        else:
+            resolved = str(exact[0]["username"]) if len(exact) == 1 else value
+            if len(exact) > 1:
+                logger.warning("Ambiguous WeChat contact %s has %d exact matches; using literal value", value, len(exact))
         self._resolved_users[value] = resolved
         return resolved
 
@@ -273,7 +283,7 @@ class WeChatGateway:
                     self.listener.add_listener(target_user, on_direct)
                     self._subscriptions.append((target_user, on_direct))
                     listened_users.add(target_user)
-                    logger.info("Listening for clarification replies from %s", target)
+                    logger.info("Listening to forward_to direct chat %s", target)
 
             logger.info("Live WeChat subscriptions updated: groups=%d targets=%d", len(groups), len(listened_users))
 
@@ -300,7 +310,7 @@ class WeChatGateway:
             try:
                 rows = connection.execute(
                     "SELECT local_id, local_type, real_sender_id, create_time, "
-                    "message_content, sort_seq FROM %s "
+                    "message_content, sort_seq, origin_source FROM %s "
                     "ORDER BY sort_seq DESC LIMIT ? OFFSET ?" % table,
                     (limit, offset),
                 ).fetchall()
@@ -314,6 +324,7 @@ class WeChatGateway:
                     "create_time": row["create_time"],
                     "content": row["message_content"],
                     "sort_seq": row["sort_seq"],
+                    "origin_source": row["origin_source"],
                 }
                 for row in rows
             ]
@@ -325,12 +336,17 @@ class WeChatGateway:
         data = dict(message) if isinstance(message, dict) else dict(vars(message))
         local_id = data.get("local_id") or data.get("id")
         content = data.get("content")
-        if local_id is not None and re.fullmatch(r"\[[^\]]+\]", str(content or "").strip()):
-            raw = self.db.get_message_row(user, int(local_id))
+        needs_raw = local_id is not None and (
+            data.get("origin_source") is None or re.fullmatch(r"\[[^\]]+\]", str(content or "").strip())
+        )
+        if needs_raw:
+            raw = self._raw_message_fields(user, int(local_id))
             if raw is not None:
-                content = raw.get("content")
-                data.setdefault("sender_id", raw.get("sender_id"))
-                data.setdefault("sort_seq", raw.get("sort_seq"))
+                if re.fullmatch(r"\[[^\]]+\]", str(content or "").strip()):
+                    content = raw.get("content")
+                data["sender_id"] = raw.get("sender_id", data.get("sender_id"))
+                data["sort_seq"] = raw.get("sort_seq", data.get("sort_seq"))
+                data["origin_source"] = raw.get("origin_source")
         message_type = str(data.get("type") or data.get("local_type") or "unknown")
         decoded_sender, decoded_content = decode_wechat_content(content, message_type)
         sender_id = data.get("sender_id") or data.get("real_sender_id")
@@ -338,16 +354,43 @@ class WeChatGateway:
         if str(sender or "").isdigit() and decoded_sender is None:
             sender = str(sender_id or "")
         sender_text = str(sender or "")
-        sender_name = "我" if sender_id == 2 else self._sender_display_name(sender_text)
+        origin_source = data.get("origin_source")
+        if origin_source is not None:
+            direction = "self" if int(origin_source) == 1 else ("incoming" if int(origin_source) == 2 else "system")
+        else:
+            direction = "self" if sender_id == 2 else "incoming"
+        sender_name = "我" if direction == "self" else self._sender_display_name(sender_text)
         data.update(
             {
                 "content": decoded_content,
                 "sender_username": sender_text,
                 "sender_name": sender_name,
-                "direction": "self" if sender_id == 2 else "incoming",
+                "direction": direction,
             }
         )
         return normalize_message(data)
+
+    def _raw_message_fields(self, user: str, local_id: int) -> dict[str, Any] | None:
+        found = self.db._msg_conn(user)
+        if not found:
+            return None
+        connection, table = found
+        try:
+            row = connection.execute(
+                "SELECT message_content, real_sender_id, sort_seq, origin_source "
+                "FROM %s WHERE local_id=?" % table,
+                (local_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return {
+            "content": row["message_content"],
+            "sender_id": row["real_sender_id"],
+            "sort_seq": row["sort_seq"],
+            "origin_source": row["origin_source"],
+        }
 
     def _sender_display_name(self, sender: str) -> str | None:
         if not sender:

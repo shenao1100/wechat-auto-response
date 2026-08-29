@@ -81,6 +81,12 @@ class ServiceHotReloadTests(unittest.TestCase):
                 self.assertTrue(trigger["queued"])
                 pending = service.store.pending_incoming()
                 self.assertEqual(pending[-1]["message"]["_internal_trigger"], "history_review")
+
+                service.on_direct_message("Bob", {"id": 88, "time": 123, "content": "明天九点提醒我交材料"})
+                direct = service.store.pending_incoming()[-1]
+                self.assertEqual(direct["group_id"], "Bob")
+                self.assertTrue(direct["message"]["_direct_chat"])
+                self.assertEqual(direct["message"]["_direct_target"], "Bob")
             finally:
                 service.shutdown()
 
