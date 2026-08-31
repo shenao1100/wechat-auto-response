@@ -236,6 +236,7 @@ class AgentTests(unittest.TestCase):
             name="宿舍通知群",
             forward_to=("Alice",),
             chain_enabled=True,
+            chain_review_history=False,
             chain_rules=(ChainRuleConfig(
                 name="宿舍晚点名",
                 match_keywords=keywords,
@@ -405,6 +406,23 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(outcome, "ignored")
         self.assertNotIn("continue_group_chain", client.tool_names)
+
+    def test_manual_history_review_can_check_chain_when_enabled(self):
+        gateway = ChainGateway()
+        client = ChainClient()
+        runtime = ToolRuntime(self.store, gateway, self.outbound.append, "Asia/Shanghai", 24)
+        agent = AgentRunner(client, runtime, gateway, self.store, "fake", 5, "Asia/Shanghai", 24)
+        base = self.chain_group()
+        group = GroupConfig(
+            id=base.id, name=base.name, forward_to=base.forward_to,
+            chain_enabled=True, chain_review_history=True, chain_rules=base.chain_rules,
+        )
+        message = {"type": "manual_history_review", "content": "管理员触发", "_internal_trigger": "history_review"}
+
+        outcome = agent.run(MessageBatch(group, [message]))
+
+        self.assertEqual(outcome, "chain_joined")
+        self.assertEqual(self.store.claim_delivery()["target"], "dorm@chatroom")
 
 
 if __name__ == "__main__":

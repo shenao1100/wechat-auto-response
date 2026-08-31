@@ -14,7 +14,10 @@
     "temperature": 0.1,
     "max_steps": 10,
     "verify_ssl": true,
-    "log_requests": false
+    "log_requests": false,
+    "thinking_enabled": false,
+    "reasoning_effort": "low",
+    "retry_attempts": 2
   },
   "defaults": {
     "history_limit": 30,
@@ -32,10 +35,12 @@
       "enabled": true,
       "chain": {
         "enabled": false,
+        "review_history": false,
         "rules": [
           {
             "name": "宿舍晚点名",
             "enabled": true,
+            "prompt": "只参加标题包含‘宿舍晚点名’的接龙。按照群里已有条目的格式填写本人宿舍和状态；如果历史中已有本人姓名或相同内容，则不要重复参加。",
             "match_keywords": ["晚点名", "宿舍"],
             "exclude_keywords": ["无需接龙"],
             "entry_template": "{{profile.dormitory}} {{profile.name}}已返校",

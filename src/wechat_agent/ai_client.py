@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import ssl
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Protocol
@@ -49,6 +50,8 @@ class OpenAICompatibleClient:
             "tools": tools,
             "tool_choice": "auto",
             "temperature": self.config.temperature,
+            "thinking": {"type": "enabled" if self.config.thinking_enabled else "disabled"},
+            "reasoning_effort": self.config.reasoning_effort,
         }
         if self.config.log_requests:
             logger.info(
@@ -64,18 +67,32 @@ class OpenAICompatibleClient:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(
-                request,
-                timeout=self.config.timeout_seconds,
-                context=self.ssl_context,
-            ) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")[:2000]
-            raise AIError(f"AI upstream returned HTTP {exc.code}: {body}") from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise AIError(f"AI upstream request failed: {exc}") from exc
+        total_attempts = self.config.retry_attempts + 1
+        for attempt in range(total_attempts):
+            try:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=self.config.timeout_seconds,
+                    context=self.ssl_context,
+                ) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:2000]
+                retryable = exc.code == 429 or 500 <= exc.code < 600
+                if not retryable or attempt >= total_attempts - 1:
+                    raise AIError(f"AI upstream returned HTTP {exc.code}: {body}") from exc
+                logger.warning("AI upstream HTTP %s; retrying attempt %d/%d", exc.code, attempt + 1, total_attempts - 1)
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if attempt >= total_attempts - 1:
+                    raise AIError(f"AI upstream request failed: {exc}") from exc
+                logger.warning("AI upstream request failed (%s); retrying attempt %d/%d", exc, attempt + 1, total_attempts - 1)
+            except json.JSONDecodeError as exc:
+                if attempt >= total_attempts - 1:
+                    raise AIError(f"AI upstream returned invalid JSON: {exc}") from exc
+                logger.warning("AI upstream returned invalid JSON; retrying attempt %d/%d", attempt + 1, total_attempts - 1)
+            if attempt < total_attempts - 1:
+                time.sleep(min(2 ** attempt, 8))
 
         try:
             return result["choices"][0]["message"]

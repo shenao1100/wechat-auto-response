@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import urllib.error
 import unittest
 from unittest.mock import patch
 
@@ -66,6 +67,28 @@ class AIClientSSLTests(unittest.TestCase):
         self.assertIn("完整系统提示", output)
         self.assertIn('"name": "demo"', output)
         self.assertNotIn("secret-that-must-not-be-logged", output)
+
+    def test_thinking_is_disabled_and_effort_is_low_by_default(self):
+        config = AIConfig(base_url="https://example.invalid/v1", model="fake")
+        with patch.dict(os.environ, {"AI_API_KEY": "test-key"}):
+            client = OpenAICompatibleClient(config)
+        with patch("wechat_agent.ai_client.urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+            client.complete([], [])
+        payload = json.loads(urlopen.call_args.args[0].data.decode())
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+        self.assertEqual(payload["reasoning_effort"], "low")
+
+    def test_retry_attempts_retries_transient_upstream_failure(self):
+        config = AIConfig(base_url="https://example.invalid/v1", model="fake", retry_attempts=2)
+        with patch.dict(os.environ, {"AI_API_KEY": "test-key"}):
+            client = OpenAICompatibleClient(config)
+        transient = urllib.error.URLError("connection reset")
+        with patch("wechat_agent.ai_client.urllib.request.urlopen", side_effect=[transient, FakeResponse()]) as urlopen:
+            with patch("wechat_agent.ai_client.time.sleep") as sleep:
+                result = client.complete([], [])
+        self.assertEqual(result["content"], "ok")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
 
 
 if __name__ == "__main__":

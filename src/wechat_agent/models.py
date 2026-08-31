@@ -8,7 +8,8 @@ from typing import Any
 @dataclass(frozen=True)
 class ChainRuleConfig:
     name: str
-    match_keywords: tuple[str, ...]
+    prompt: str = ""
+    match_keywords: tuple[str, ...] = ()
     exclude_keywords: tuple[str, ...] = ()
     entry_template: str = ""
     self_identifiers: tuple[str, ...] = ()
@@ -26,6 +27,7 @@ class GroupConfig:
     importance_threshold: int = 70
     enabled: bool = True
     chain_enabled: bool = False
+    chain_review_history: bool = False
     chain_rules: tuple[ChainRuleConfig, ...] = ()
 
 
@@ -39,6 +41,9 @@ class AIConfig:
     max_steps: int = 10
     verify_ssl: bool = True
     log_requests: bool = False
+    thinking_enabled: bool = False
+    reasoning_effort: str = "low"
+    retry_attempts: int = 2
 
 
 @dataclass(frozen=True)

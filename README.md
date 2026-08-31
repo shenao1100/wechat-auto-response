@@ -62,7 +62,8 @@ Copy-Item config.example.json config.json
 - `groups[].forward_to`：一个或多个微信联系人。
 - `groups[].system_prompt_file`：相对配置文件所在目录解析。
 - `groups[].chain.enabled`：是否允许该群自动接龙，默认关闭。
-- `groups[].chain.rules[]`：接龙白名单规则；配置必须包含的关键词、排除关键词、内容模板和本人识别标记。模板使用 `{{memory.key}}` 引用全局共享记忆，缺失时会向 `forward_to` 询问。
+- `groups[].chain.review_history`：是否在 WebUI“立即回顾历史”时检查并执行匹配的接龙，默认关闭。
+- `groups[].chain.rules[]`：接龙规则。以 `prompt` 自然语言描述参加条件、填写方式和本人判定；`match_keywords`、`exclude_keywords`、`entry_template` 与 `self_identifiers` 均为可选增强约束。模板使用 `{{memory.key}}` 引用全局共享记忆，缺失时会向 `forward_to` 询问。
 - `importance_threshold`：低于此分数时，程序拒绝执行转发工具。
 
 先检查 JSON 配置：

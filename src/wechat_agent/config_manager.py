@@ -41,6 +41,9 @@ class ConfigManager:
                 "max_steps": ai.get("max_steps", 10),
                 "verify_ssl": ai.get("verify_ssl", True),
                 "log_requests": ai.get("log_requests", False),
+                "thinking_enabled": ai.get("thinking_enabled", False),
+                "reasoning_effort": ai.get("reasoning_effort", "low"),
+                "retry_attempts": ai.get("retry_attempts", 2),
                 "api_key_present": bool(os.environ.get(str(ai.get("api_key_env", "AI_API_KEY")))),
             },
             "defaults": raw.get("defaults") or {},
@@ -74,13 +77,13 @@ class ConfigManager:
                 keywords = list(dict.fromkeys(
                     str(value).strip() for value in rule.get("match_keywords") or [] if str(value).strip()
                 ))
+                prompt = str(rule.get("prompt") or "").strip()
                 template = str(rule.get("entry_template") or "").strip()
-                if not keywords:
-                    raise ValueError(f"Chain rule {rule_index + 1} in {name} requires match_keywords")
-                if not template:
-                    raise ValueError(f"Chain rule {rule_index + 1} in {name} requires entry_template")
+                if not prompt and not template:
+                    raise ValueError(f"Chain rule {rule_index + 1} in {name} requires prompt")
                 clean_chain_rules.append({
                     "name": str(rule.get("name") or f"接龙规则 {rule_index + 1}").strip()[:100],
+                    "prompt": (prompt or f"按接龙模板填写：{template}")[:4000],
                     "enabled": bool(rule.get("enabled", True)),
                     "match_keywords": keywords[:20],
                     "exclude_keywords": list(dict.fromkeys(
@@ -103,6 +106,7 @@ class ConfigManager:
                     "importance_threshold": max(0, min(100, int(item.get("importance_threshold", 70)))),
                     "chain": {
                         "enabled": bool(chain.get("enabled", False)),
+                        "review_history": bool(chain.get("review_history", False)),
                         "rules": clean_chain_rules,
                     },
                 }

@@ -38,6 +38,10 @@ def load_config(path: str | Path) -> AppConfig:
         max_steps=max(1, int(ai_raw.get("max_steps", 10))),
         verify_ssl=bool(ai_raw.get("verify_ssl", True)),
         log_requests=bool(ai_raw.get("log_requests", False)),
+        thinking_enabled=bool(ai_raw.get("thinking_enabled", False)),
+        reasoning_effort=str(ai_raw.get("reasoning_effort", "low")).lower()
+        if str(ai_raw.get("reasoning_effort", "low")).lower() in {"low", "high", "max"} else "low",
+        retry_attempts=max(0, min(10, int(ai_raw.get("retry_attempts", 2)))),
     )
 
     defaults = raw.get("defaults") or {}
@@ -61,14 +65,14 @@ def load_config(path: str | Path) -> AppConfig:
             keywords = tuple(
                 dict.fromkeys(str(value).strip() for value in rule.get("match_keywords") or [] if str(value).strip())
             )
+            prompt = str(rule.get("prompt") or "").strip()
             template = str(rule.get("entry_template") or "").strip()
-            if not keywords:
-                raise ConfigError(f"{rule_location}.match_keywords must not be empty")
-            if not template:
-                raise ConfigError(f"{rule_location}.entry_template must not be empty")
+            if not prompt and not template:
+                raise ConfigError(f"{rule_location}.prompt must not be empty")
             chain_rules.append(
                 ChainRuleConfig(
                     name=str(rule.get("name") or f"接龙规则 {rule_index + 1}"),
+                    prompt=prompt or f"按接龙模板填写：{template}",
                     match_keywords=keywords,
                     exclude_keywords=tuple(
                         dict.fromkeys(
@@ -101,6 +105,7 @@ def load_config(path: str | Path) -> AppConfig:
                 ),
                 enabled=bool(item.get("enabled", True)),
                 chain_enabled=bool(chain_raw.get("enabled", False)),
+                chain_review_history=bool(chain_raw.get("review_history", False)),
                 chain_rules=tuple(chain_rules),
             )
         )

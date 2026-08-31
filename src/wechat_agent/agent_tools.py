@@ -35,7 +35,7 @@ def match_chain_rule(group: GroupConfig, chain: dict[str, Any]) -> ChainRuleConf
     for rule in group.chain_rules:
         includes = [value.casefold() for value in rule.match_keywords]
         excludes = [value.casefold() for value in rule.exclude_keywords]
-        if rule.enabled and includes and all(value in haystack for value in includes) and not any(
+        if rule.enabled and (not includes or all(value in haystack for value in includes)) and not any(
             value in haystack for value in excludes
         ):
             return rule
@@ -177,6 +177,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "按当前群手动配置的接龙规则参与 #接龙。程序会重新读取最新版本、检测本人是否已经参与、按配置模板生成内容、自动编号并持久化去重。",
             {
                 "source_message_id": {"type": ["integer", "string"], "description": "包含 #接龙 的历史消息 id"},
+                "entry": {"type": "string", "description": "按规则 Prompt 生成的本人单行内容；有固定模板时省略"},
             },
             ["source_message_id"],
         ),
@@ -371,7 +372,9 @@ class ToolRuntime:
         if missing:
             return ToolExecution({"ok": False, "error": "Missing required shared memory", "missing_memory_keys": missing})
         if not entry:
-            return ToolExecution({"ok": False, "error": "The configured entry template rendered as empty"})
+            entry = str(args.get("entry") or "").strip()
+        if not entry:
+            return ToolExecution({"ok": False, "error": "entry is required when the rule has no fixed template"})
         entry = " ".join(entry.splitlines()).strip()[:500]
         if "#接龙" in entry:
             raise ValueError("Configured entry template must render to one entry, not a chain")

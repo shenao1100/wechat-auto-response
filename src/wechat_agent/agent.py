@@ -57,15 +57,24 @@ class AgentRunner:
         self.duplicate_window_hours = duplicate_window_hours
 
     def run(self, batch: MessageBatch) -> str:
+        manual_history_review = any(
+            message.get("_internal_trigger") == "history_review" for message in batch.messages
+        )
         matching_chain = self._matching_chain(batch)
+        if (
+            matching_chain is None
+            and manual_history_review
+            and batch.group.id.endswith("@chatroom")
+            and batch.group.chain_enabled
+            and batch.group.chain_review_history
+        ):
+            history_for_review = self.gateway.get_history(batch.group.id, max(100, batch.group.history_limit))
+            matching_chain = self._matching_chain(batch, history_for_review)
         if batch.group.id.endswith("@chatroom") and matching_chain is not None:
             chain, rule = matching_chain
             return self._run_group_chain(batch, chain, rule)
         if any(message.get("_direct_chat") for message in batch.messages):
             return self._run_direct_chat(batch)
-        manual_history_review = any(
-            message.get("_internal_trigger") == "history_review" for message in batch.messages
-        )
         history = self.store.annotate_history(
             batch.group.id,
             self.gateway.get_history(batch.group.id, batch.group.history_limit),
@@ -225,9 +234,12 @@ class AgentRunner:
         return "max_steps"
 
     @staticmethod
-    def _matching_chain(batch: MessageBatch) -> tuple[dict[str, Any], ChainRuleConfig] | None:
+    def _matching_chain(
+        batch: MessageBatch,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], ChainRuleConfig] | None:
         candidates: list[dict[str, Any]] = []
-        for message in batch.messages:
+        for message in messages if messages is not None else batch.messages:
             parsed = parse_chain_message(message.get("content"))
             if parsed:
                 candidates.append(parsed)
@@ -250,8 +262,10 @@ class AgentRunner:
         system = f"""你是微信群接龙执行 Agent。当前群：{batch.group.name}（{batch.group.id}）。
 当前时间：{now}；时区：{timezone_label(self.timezone, self.timezone_name)}。
 该接龙已匹配管理员手动启用的规则“{rule.name}”。只有匹配规则的接龙才允许参与。
-接龙内容必须由规则模板生成，AI 不得自行编写或修改。若 missing_memory_keys 非空，必须针对缺失的每个键调用 ask_forward_target，memory_key 必须原样使用对应键；询问后等待答复，不要先接龙。
-若模板资料完整，从 recent_history 选择同主题最新接龙消息的 id 并调用 continue_group_chain；不要传入自拟内容。
+管理员规则 Prompt：
+{rule.prompt}
+严格遵守上述 Prompt。若 missing_memory_keys 非空，必须针对缺失的每个键调用 ask_forward_target，memory_key 必须原样使用对应键；询问后等待答复，不要先接龙。
+若有 rendered_entry，从 recent_history 选择同主题最新接龙消息的 id 并调用 continue_group_chain；若没有固定模板，则根据规则 Prompt 生成一行 entry 传给工具。
 continue_group_chain 会在发送前重新匹配规则、渲染模板，并通过消息方向、完整条目、本人识别标记和本地记录检测是否已经接过。已经接过时必须跳过发送，也视为正常处理。所有工具都不是终止工具。
 完成后仅回复以下一种格式：
 CHAIN_DECISION: {{"joined": true, "awaiting_clarification": false, "reason": "处理结果"}}
@@ -262,6 +276,7 @@ CHAIN_DECISION: {{"joined": false, "awaiting_clarification": true, "reason": "�
             "matched_chain": chain,
             "matched_rule": {
                 "name": rule.name,
+                "prompt": rule.prompt,
                 "match_keywords": rule.match_keywords,
                 "exclude_keywords": rule.exclude_keywords,
                 "entry_template": rule.entry_template,
