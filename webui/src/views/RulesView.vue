@@ -1,18 +1,20 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { api } from '../api'
 
-const catalog = ref([]), configured = ref([]), prompts = ref([]), selectedId = ref(''), search = ref(''), contactQuery = ref(''), contacts = ref([])
-const loading = ref(true), saving = ref(false), triggering = ref(false), error = ref(''), toast = ref(''), contactTimer = ref(null)
+const catalog = ref([]), configured = ref([]), prompts = ref([]), napcatContacts = ref([]), selectedId = ref(''), search = ref(''), contactQuery = ref('')
+const napcat = ref({ enabled: false, websocket_url: 'ws://127.0.0.1:3001', access_token: '', access_token_configured: false, reconnect_seconds: 5, request_timeout_seconds: 30 })
+const loading = ref(true), saving = ref(false), savingNapcat = ref(false), triggering = ref(false), contactPickerOpen = ref(false), error = ref(''), toast = ref('')
 const selected = computed(() => configured.value.find(g => g.id === selectedId.value))
 const filteredCatalog = computed(() => { const q=search.value.trim().toLowerCase(); return catalog.value.filter(g => !q || `${g.name} ${g.username}`.toLowerCase().includes(q)) })
+const filteredContacts = computed(() => { const q=contactQuery.value.trim().toLowerCase(); return napcatContacts.value.filter(x => !q || `${x.name} ${x.nickname} ${x.remark} ${x.user_id}`.toLowerCase().includes(q)) })
 
 function addGroup(group) {
   if (!configured.value.some(item => item.id === group.username)) configured.value.push({ id: group.username, name: group.name, forward_to: [], system_prompt_file: 'prompts/class_group.md', enabled: true, history_limit: 30, aggregation_seconds: 8, importance_threshold: 70, chain: { enabled: false, rules: [] } })
   selectedId.value = group.username
 }
 function removeGroup() { const i=configured.value.findIndex(g=>g.id===selectedId.value); if(i>=0) configured.value.splice(i,1); selectedId.value=configured.value[0]?.id||'' }
-function addTarget(contact) { if(selected.value && !selected.value.forward_to.includes(contact.name)) selected.value.forward_to.push(contact.name); contactQuery.value=''; contacts.value=[] }
+function addTarget(contact) { if(selected.value && !selected.value.forward_to.includes(contact.user_id)) selected.value.forward_to.push(contact.user_id); contactPickerOpen.value=false }
 function removeTarget(target) { selected.value.forward_to = selected.value.forward_to.filter(item=>item!==target) }
 function addChainRule() {
   selected.value.chain ||= { enabled: false, rules: [] }
@@ -22,15 +24,26 @@ function removeChainRule(index) { selected.value.chain.rules.splice(index, 1) }
 function listText(values) { return (values || []).join('\n') }
 function setList(rule, key, value) { rule[key] = [...new Set(value.split(/[\n,，]/).map(item=>item.trim()).filter(Boolean))] }
 async function save() { saving.value=true;error.value='';try{const result=await api.saveGroups(configured.value);toast.value=result.hot_reload?.applied?'规则已保存并热更新':'规则已保存';setTimeout(()=>toast.value='',2500)}catch(e){error.value=e.message}finally{saving.value=false} }
+async function saveNapcat() { savingNapcat.value=true;error.value='';try{const result=await api.saveNapcat(napcat.value);toast.value=result.hot_reload?.applied?'NapCat 配置已保存并热更新':'NapCat 配置已保存';setTimeout(()=>toast.value='',2500)}catch(e){error.value=e.message}finally{savingNapcat.value=false} }
 async function triggerReview() { triggering.value=true;error.value='';try{await api.saveGroups(configured.value);const result=await api.evaluateGroup(selected.value.id);toast.value=`已触发 ${selected.value.name} 的历史判断（最近 ${result.history_limit} 条）`;setTimeout(()=>toast.value='',3500)}catch(e){error.value=e.message}finally{triggering.value=false} }
-watch(contactQuery, value => { clearTimeout(contactTimer.value); if(!value.trim()){contacts.value=[];return} contactTimer.value=setTimeout(async()=>{try{contacts.value=(await api.contacts(value)).filter(x=>!x.is_group)}catch(e){error.value=e.message}},250) })
-onMounted(async()=>{try{const [s,g,p]=await Promise.all([api.settings(),api.groups(),api.prompts()]);configured.value=JSON.parse(JSON.stringify(s.groups)).map(group=>({ ...group, chain: group.chain || { enabled: false, rules: [] } }));catalog.value=g;prompts.value=p;if(configured.value.length)selectedId.value=configured.value[0].id}catch(e){error.value=e.message}finally{loading.value=false}})
+onMounted(async()=>{try{const [s,g,p]=await Promise.all([api.settings(),api.groups(),api.prompts()]);configured.value=JSON.parse(JSON.stringify(s.groups)).map(group=>({ ...group, chain: group.chain || { enabled: false, rules: [] } }));napcat.value={...napcat.value,...(s.napcat||{})};catalog.value=g;prompts.value=p;if(napcat.value.enabled) napcatContacts.value=await api.napcatContacts();if(configured.value.length)selectedId.value=configured.value[0].id}catch(e){error.value=e.message}finally{loading.value=false}})
 </script>
 
 <template>
   <div class="page-head"><div><h2>监听与转发</h2><p>先从完整微信群聊目录选择监听对象，再为每个群设置转发链路和判断策略。</p></div><div class="actions"><span class="pill success">支持热更新</span><button class="btn primary" :disabled="saving" @click="save">{{ saving?'保存中…':'保存全部规则' }}</button></div></div>
   <div v-if="error" class="error-box">{{ error }}</div><div v-if="loading" class="loading">正在读取微信完整群聊目录…</div>
-  <div v-else class="rules-layout">
+  <div v-else>
+    <section class="card napcat-card">
+      <div class="card-head"><div><h3>NapCat WebSocket 转发</h3><small class="muted">forward_to 使用 NapCat OneBot 11 的 QQ 号；微信群监听仍由当前微信库负责。</small></div><button class="btn primary small" :disabled="savingNapcat" @click="saveNapcat">{{ savingNapcat?'保存中…':'保存 NapCat 配置' }}</button></div>
+      <div class="card-body form-grid">
+        <div class="field"><label>启用 NapCat</label><select v-model="napcat.enabled" class="select"><option :value="false">关闭，使用原微信通道</option><option :value="true">启用，forward_to 走 WebSocket</option></select></div>
+        <div class="field"><label>WebSocket 地址</label><input v-model="napcat.websocket_url" class="input" placeholder="ws://127.0.0.1:3001" /></div>
+        <div class="field"><label>Access Token</label><input v-model="napcat.access_token" class="input mono" type="password" :placeholder="napcat.access_token_configured ? '已配置；留空保持不变' : '填写 NapCat WebSocket Token'" autocomplete="new-password" /></div>
+        <div class="field"><label>重连间隔（秒）</label><input v-model.number="napcat.reconnect_seconds" class="input" type="number" min="1" max="300" /></div>
+        <div class="field"><label>请求超时（秒）</label><input v-model.number="napcat.request_timeout_seconds" class="input" type="number" min="5" max="3600" /></div>
+      </div>
+    </section>
+    <div class="rules-layout">
     <aside class="card catalog-panel">
       <div class="card-head"><h3>① 微信群聊目录</h3><span class="pill neutral">{{ catalog.length }} 个</span></div>
       <div class="catalog-search search"><input v-model="search" class="input" placeholder="搜索群名或内部 ID" /></div>
@@ -52,8 +65,8 @@ onMounted(async()=>{try{const [s,g,p]=await Promise.all([api.settings(),api.grou
           <div class="form-grid"><div class="field"><label>后台显示名称</label><input v-model="selected.name" class="input" /></div><div class="field"><label>监听状态</label><select v-model="selected.enabled" class="select"><option :value="true">启用</option><option :value="false">停用</option></select></div><div class="field"><label>初始历史条数</label><input v-model.number="selected.history_limit" type="number" min="1" max="200" class="input" /><small>实时消息和“立即回顾历史”都会读取这个数量。</small></div><div class="field"><label>消息聚合窗口（秒）</label><input v-model.number="selected.aggregation_seconds" type="number" min="0.1" max="60" step="0.5" class="input" /><small>连续消息会合并成一个事件。</small></div></div>
           <div class="divider"></div><div class="section-title"><span>B</span><h4>转发与澄清链路</h4></div>
           <div class="target-chips"><span v-for="target in selected.forward_to" :key="target">{{ target }}<button @click="removeTarget(target)">×</button></span><em v-if="!selected.forward_to.length">尚未选择 forward_to</em></div>
-          <div class="contact-picker"><div class="search"><input v-model="contactQuery" class="input" placeholder="搜索联系人昵称、备注或微信号" /></div><div v-if="contacts.length" class="contact-results"><button v-for="contact in contacts" :key="contact.username" @click="addTarget(contact)"><span>{{ contact.name.slice(0,1) }}</span><div><strong>{{ contact.name }}</strong><small>{{ contact.nickname || contact.username }}</small></div><i>添加</i></button></div></div>
-          <p class="hint">重要摘要和 Agent 的澄清问题都会发往上述联系人。澄清答复将自动写入所有群共享的长期记忆。</p>
+           <div class="contact-picker"><div class="search target-entry"><input v-model="contactQuery" class="input" placeholder="搜索 NapCat 好友昵称、备注或 QQ 号" @focus="contactPickerOpen=true" /><button v-if="contactPickerOpen" class="btn small" type="button" @click="contactPickerOpen=false">收起</button></div><div v-if="contactPickerOpen && !napcat.enabled" class="hint">请先在上方启用 NapCat 并保存配置。</div><div v-else-if="contactPickerOpen && !napcatContacts.length" class="hint">暂无好友列表，请确认 NapCat WebSocket 已连接。</div><div v-else-if="contactPickerOpen" class="contact-results"><button v-for="contact in filteredContacts" :key="contact.user_id" type="button" :disabled="selected.forward_to.includes(contact.user_id)" @click="addTarget(contact)"><span>{{ contact.name.slice(0,1) }}</span><div><strong>{{ contact.name }}</strong><small>{{ contact.remark || contact.nickname }} · {{ contact.user_id }}</small></div><i>{{ selected.forward_to.includes(contact.user_id)?'已添加':'添加' }}</i></button></div></div>
+           <p class="hint">重要摘要和 Agent 的澄清问题都会发往上述 NapCat QQ 号。添加时保存稳定的 QQ 号，不使用昵称。</p>
           <div class="divider"></div><div class="section-title"><span>C</span><h4>重要性判断策略</h4></div>
           <div class="form-grid"><div class="field"><label>Prompt 模板</label><select v-model="selected.system_prompt_file" class="select"><option value="">无群专属 Prompt</option><option v-for="prompt in prompts" :key="prompt.name" :value="`prompts/${prompt.name}`">{{ prompt.name }}</option></select><small><RouterLink to="/prompts">前往 Prompt 管理器编辑内容</RouterLink></small></div><div class="field"><label>转发阈值：{{ selected.importance_threshold }}</label><input v-model.number="selected.importance_threshold" type="range" min="0" max="100" class="range" /><small>AI 分数低于阈值时，程序拒绝执行转发。</small></div></div>
           <div class="divider"></div><div class="section-title"><span>D</span><h4>自动接龙规则</h4></div>
@@ -74,6 +87,7 @@ onMounted(async()=>{try{const [s,g,p]=await Promise.all([api.settings(),api.grou
       </div>
       <div v-else class="card empty"><strong>从左侧选择一个群聊</strong>选择后将在这里配置转发对象、Prompt 和判断阈值。</div>
     </section>
+    </div>
   </div>
   <div v-if="toast" class="toast">{{ toast }}</div>
 </template>

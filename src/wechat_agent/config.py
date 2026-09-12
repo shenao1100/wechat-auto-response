@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .models import AIConfig, AppConfig, ChainRuleConfig, GroupConfig
+from .models import AIConfig, AppConfig, ChainRuleConfig, GroupConfig, NapCatConfig
 
 
 class ConfigError(ValueError):
@@ -45,6 +45,14 @@ def load_config(path: str | Path) -> AppConfig:
     )
 
     defaults = raw.get("defaults") or {}
+    napcat_raw = raw.get("napcat") or {}
+    napcat = NapCatConfig(
+        enabled=bool(napcat_raw.get("enabled", False)),
+        websocket_url=str(napcat_raw.get("websocket_url", "ws://127.0.0.1:3001")).rstrip("/"),
+        access_token=str(napcat_raw.get("access_token") or ""),
+        reconnect_seconds=max(1.0, float(napcat_raw.get("reconnect_seconds", 5))),
+        request_timeout_seconds=max(5.0, float(napcat_raw.get("request_timeout_seconds", 30))),
+    )
     groups: list[GroupConfig] = []
     for index, item in enumerate(raw.get("groups") or []):
         location = f"groups[{index}]"
@@ -119,6 +127,7 @@ def load_config(path: str | Path) -> AppConfig:
     return AppConfig(
         ai=ai,
         groups=tuple(groups),
+        napcat=napcat,
         timezone=str(raw.get("timezone", "Asia/Shanghai")),
         database_path=relative_path(str(raw.get("database_path", "data/app.db"))),
         log_path=relative_path(str(raw.get("log_path", "logs/app.log"))),
@@ -126,4 +135,5 @@ def load_config(path: str | Path) -> AppConfig:
         schedule_poll_seconds=max(1.0, float(raw.get("schedule_poll_seconds", 5.0))),
         send_verify=bool(raw.get("send_verify", True)),
         duplicate_window_hours=max(1, int(raw.get("duplicate_window_hours", 24))),
+        delivery_timeout_seconds=max(5.0, min(3600.0, float(raw.get("delivery_timeout_seconds", 30)))),
     )

@@ -47,9 +47,19 @@ class AIConfig:
 
 
 @dataclass(frozen=True)
+class NapCatConfig:
+    enabled: bool = False
+    websocket_url: str = "ws://127.0.0.1:3001"
+    access_token: str = field(default="", repr=False)
+    reconnect_seconds: float = 5.0
+    request_timeout_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class AppConfig:
     ai: AIConfig
     groups: tuple[GroupConfig, ...]
+    napcat: NapCatConfig = field(default_factory=NapCatConfig)
     timezone: str = "Asia/Shanghai"
     database_path: str = "data/app.db"
     log_path: str = "logs/app.log"
@@ -57,6 +67,7 @@ class AppConfig:
     schedule_poll_seconds: float = 5.0
     send_verify: bool = True
     duplicate_window_hours: int = 24
+    delivery_timeout_seconds: float = 30.0
 
 
 @dataclass

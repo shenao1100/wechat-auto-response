@@ -27,12 +27,22 @@ class ConfigManager:
     def public_settings(self) -> dict[str, Any]:
         raw = self.read_raw()
         ai = raw.get("ai") or {}
+        napcat = raw.get("napcat") or {}
         return {
             "timezone": raw.get("timezone", "Asia/Shanghai"),
             "poll_interval": raw.get("poll_interval", 1.0),
             "schedule_poll_seconds": raw.get("schedule_poll_seconds", 5.0),
             "send_verify": raw.get("send_verify", True),
             "duplicate_window_hours": raw.get("duplicate_window_hours", 24),
+            "delivery_timeout_seconds": raw.get("delivery_timeout_seconds", 30),
+            "napcat": {
+                "enabled": bool(napcat.get("enabled", False)),
+                "websocket_url": napcat.get("websocket_url", "ws://127.0.0.1:3001"),
+                "access_token": "",
+                "access_token_configured": bool(napcat.get("access_token")),
+                "reconnect_seconds": napcat.get("reconnect_seconds", 5),
+                "request_timeout_seconds": napcat.get("request_timeout_seconds", 30),
+            },
             "ai": {
                 "base_url": ai.get("base_url", ""),
                 "model": ai.get("model", ""),
@@ -49,6 +59,24 @@ class ConfigManager:
             "defaults": raw.get("defaults") or {},
             "groups": raw.get("groups") or [],
         }
+
+    def replace_napcat(self, payload: dict[str, Any]) -> None:
+        websocket_url = str(payload.get("websocket_url") or "").strip().rstrip("/")
+        if not websocket_url.startswith(("ws://", "wss://")):
+            raise ValueError("NapCat WebSocket 地址必须以 ws:// 或 wss:// 开头")
+        with self._lock:
+            raw = self.read_raw()
+            current = raw.get("napcat") or {}
+            submitted_token = str(payload.get("access_token") or "").strip()
+            value = {
+                "enabled": bool(payload.get("enabled", False)),
+                "websocket_url": websocket_url,
+                "access_token": submitted_token or str(current.get("access_token") or ""),
+                "reconnect_seconds": max(1, min(300, float(payload.get("reconnect_seconds", 5)))),
+                "request_timeout_seconds": max(5, min(3600, float(payload.get("request_timeout_seconds", 30)))),
+            }
+            raw["napcat"] = value
+            self._atomic_write(raw)
 
     def replace_groups(self, groups: list[dict[str, Any]]) -> None:
         if not groups:

@@ -6,6 +6,7 @@ import logging
 import queue
 import re
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from .aggregator import MessageAggregator
 from .ai_client import OpenAICompatibleClient
 from .config import load_config
 from .models import AppConfig, MessageBatch
+from .napcat import HybridGateway
 from .store import Store
 from .timeutils import get_timezone
 from .wechat_gateway import Gateway, WeChatGateway
@@ -48,7 +50,7 @@ class AgentService:
                 recovered_schedules,
             )
         self.client = client or OpenAICompatibleClient(config.ai)
-        self.gateway = gateway or WeChatGateway(poll_interval=config.poll_interval)
+        self.gateway = gateway or HybridGateway(config.napcat, WeChatGateway(poll_interval=config.poll_interval))
         self.stop_event = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._shutdown_done = False
@@ -106,6 +108,8 @@ class AgentService:
             self.runtime.duplicate_window_hours = new_config.duplicate_window_hours
             self.config = new_config
             self.agent = self._build_agent(new_config)
+            if hasattr(self.gateway, "reconfigure_napcat"):
+                self.gateway.reconfigure_napcat(new_config.napcat, new_config.groups)  # type: ignore[attr-defined]
             if self._gateway_started and hasattr(self.gateway, "reconfigure"):
                 self.gateway.reconfigure(new_config.groups)  # type: ignore[attr-defined]
             self._config_signature = self._configuration_fingerprint()
@@ -308,7 +312,15 @@ class AgentService:
                 self.agent_queue.task_done()
 
     def _send_loop(self) -> None:
+        last_recovery = 0.0
         while not self.stop_event.is_set():
+            now = time.monotonic()
+            if now - last_recovery >= 5.0:
+                recovered = self.store.recover_stale_deliveries(self.config.delivery_timeout_seconds)
+                if recovered:
+                    logger.warning("Recovered %d stale sending deliveries; queued for retry", recovered)
+                    self.outbound_wake.set()
+                last_recovery = now
             delivery = self.store.claim_delivery()
             if delivery is None:
                 self.outbound_wake.wait(1.0)
@@ -317,17 +329,36 @@ class AgentService:
             target = str(delivery["target"])
             success = False
             error = "send returned failure"
-            try:
-                success = self.gateway.send_text(target, str(delivery["text"]), self.config.send_verify)
-            except Exception as exc:
-                error = str(exc)[:2000]
-                logger.exception("Send failed target=%s delivery=%s", target, delivery["id"])
+            logger.info("Sending delivery id=%s target=%s attempt=%s", delivery["id"], target, delivery["attempts"])
+            success, error = self._send_with_timeout(target, str(delivery["text"]))
             if success:
                 logger.info("Sent delivery id=%s to %s", delivery["id"], target)
             status = self.store.finish_delivery(int(delivery["id"]), success, error)
             if not success:
                 logger.warning("Delivery id=%s target=%s outbox_status=%s", delivery["id"], target, status)
                 self.stop_event.wait(min(30, 2 ** min(5, int(delivery["attempts"]))))
+
+    def _send_with_timeout(self, target: str, text: str) -> tuple[bool, str]:
+        result: dict[str, Any] = {"success": False, "error": "send returned failure"}
+        finished = threading.Event()
+
+        def send_worker() -> None:
+            try:
+                result["success"] = bool(self.gateway.send_text(target, text, self.config.send_verify))
+                if not result["success"]:
+                    result["error"] = "send returned failure"
+            except Exception as exc:
+                result["error"] = str(exc)[:2000]
+                logger.exception("Send failed target=%s", target)
+            finally:
+                finished.set()
+
+        threading.Thread(target=send_worker, name=f"send-{target}", daemon=True).start()
+        if not finished.wait(max(1.0, self.config.delivery_timeout_seconds)):
+            error = f"send timed out after {self.config.delivery_timeout_seconds:g}s"
+            logger.error("Send timed out target=%s; delivery will be retried", target)
+            return False, error
+        return bool(result["success"]), str(result["error"])
 
     def _schedule_loop(self) -> None:
         while not self.stop_event.is_set():

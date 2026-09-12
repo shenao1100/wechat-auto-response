@@ -166,6 +166,7 @@ class Store:
                     target TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    sending_at TEXT,
                     sent_at TEXT,
                     last_error TEXT,
                     UNIQUE(outbox_id, target),
@@ -190,6 +191,11 @@ class Store:
                     ON clarifications(status, target, id);
                 """
             )
+            delivery_columns = {
+                str(row["name"]) for row in connection.execute("PRAGMA table_info(outbox_deliveries)").fetchall()
+            }
+            if "sending_at" not in delivery_columns:
+                connection.execute("ALTER TABLE outbox_deliveries ADD COLUMN sending_at TEXT")
             orphaned = connection.execute(
                 """SELECT o.id, o.targets_json, o.status, o.sent_at, o.last_error FROM outbox o
                    WHERE NOT EXISTS (
@@ -671,7 +677,7 @@ class Store:
     def recover_outbox(self) -> int:
         with self.transaction() as connection:
             deliveries = connection.execute(
-                "UPDATE outbox_deliveries SET status='pending' WHERE status='sending'"
+                "UPDATE outbox_deliveries SET status='pending', sending_at=NULL WHERE status='sending'"
             ).rowcount
             outboxes = connection.execute(
                 "UPDATE outbox SET status='pending' WHERE status='sending'"
@@ -689,8 +695,8 @@ class Store:
             if row is None:
                 return None
             connection.execute(
-                "UPDATE outbox_deliveries SET status='sending', attempts=attempts+1 WHERE id=?",
-                (int(row["id"]),),
+                "UPDATE outbox_deliveries SET status='sending', sending_at=?, attempts=attempts+1 WHERE id=?",
+                (iso_utc(), int(row["id"])),
             )
             connection.execute(
                 "UPDATE outbox SET status='sending', attempts=attempts+1 WHERE id=?",
@@ -715,7 +721,7 @@ class Store:
             delivery_status = "sent" if success else ("failed" if int(row["attempts"]) >= max_attempts else "pending")
             connection.execute(
                 """UPDATE outbox_deliveries
-                   SET status=?, sent_at=?, last_error=? WHERE id=?""",
+                   SET status=?, sending_at=NULL, sent_at=?, last_error=? WHERE id=?""",
                 (
                     delivery_status,
                     iso_utc() if success else None,
@@ -762,6 +768,29 @@ class Store:
                     ),
                 )
         return outbox_status
+
+    def recover_stale_deliveries(self, timeout_seconds: float = 30.0) -> int:
+        cutoff = iso_utc(utc_now() - timedelta(seconds=max(1.0, timeout_seconds)))
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT outbox_id FROM outbox_deliveries WHERE status='sending' AND sending_at IS NOT NULL AND sending_at<=?",
+                (cutoff,),
+            ).fetchall()
+            if not rows:
+                return 0
+            connection.execute(
+                """UPDATE outbox_deliveries
+                   SET status='pending', sending_at=NULL,
+                       last_error=?
+                   WHERE status='sending' AND sending_at IS NOT NULL AND sending_at<=?""",
+                (f"sending state timed out after {timeout_seconds:g}s; queued for retry", cutoff),
+            )
+            for row in rows:
+                connection.execute(
+                    "UPDATE outbox SET status='pending', sent_at=NULL, last_error=? WHERE id=? AND status='sending'",
+                    (f"delivery sending state timed out after {timeout_seconds:g}s", int(row["outbox_id"])),
+                )
+        return len(rows)
 
     def queue_schedule_outbox(self, limit: int = 20) -> list[int]:
         outbox_ids: list[int] = []

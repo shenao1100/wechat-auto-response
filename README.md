@@ -1,6 +1,6 @@
 # 微信群重要信息 Agent
 
-监听指定微信群，将新消息、近期历史、群聊专属提示词和长期记忆交给 OpenAI-compatible 上游。模型可以通过 tool call 获取更长历史、读写记忆、查询近期转发、创建/查看/取消日程以及转发重要信息。`forward_to` 联系人也可以直接与 Agent 私聊，新增或管理自己的日程和提醒。
+监听指定微信群，将新消息、近期历史、群聊专属提示词和长期记忆交给 OpenAI-compatible 上游。模型可以通过 tool call 获取更长历史、读写记忆、查询近期转发、创建/查看/取消日程以及转发重要信息。`forward_to` 目标可通过 NapCat OneBot 11 WebSocket 接收私聊并发送通知。
 
 ## 运行模型
 
@@ -35,13 +35,13 @@
 
 SQLite 保存长期记忆、转发事件、日程、Agent 审计记录以及持久化 inbox/outbox。微信发送始终由一个线程串行执行；每个目标联系人独立记录投递状态，某个联系人失败不会让已经成功的联系人重复收到通知。
 
-微信 GUI 发送采用 at-most-once 语义：如果 UI 已执行发送但微信数据库在校验窗口内尚未确认，系统将该投递标记为“已接受但未验证”，不会再次操作 UI。只有在发送动作本身没有完成时才进入重试，以避免相同通知重复发送。
+微信 GUI 发送由 `pywechat127` 的微信 4.1+ `pyweixin.Messages` 接口执行，并在进程内串行操作微信窗口。`pywechat` 正常返回时视为发送成功；若调用抛出异常，可靠 outbox 会按既有策略重试。
 
 监听消息会先写入 inbox，再进入内存聚合器；Agent 正常给出 `FINAL_DECISION` 后才标记完成。进程意外退出时，未完成消息会在下次启动自动重放。重要事件记录与 outbox 任务在同一 SQLite 事务中创建，避免出现“记录成已转发，但发送任务实际丢失”的状态。
 
 ## 安装
 
-要求 Windows 10/11、Python 3.10+、已登录的微信 4.1.12+，以及 `wechatauto-replica>=1.1.9`。
+要求 Windows 10/11、Python 3.10+、已登录的微信 4.1.12+。项目使用 `wechatauto-replica>=1.1.9` 监听和读取消息，使用 `pywechat127>=1.9.8` 提供的 `pyweixin` 接口执行微信发信。
 
 ```powershell
 python -m pip install -e ".[web]"
@@ -59,7 +59,10 @@ Copy-Item config.example.json config.json
 - `ai.verify_ssl`：默认 `true`；仅在可信网络中排查自签名证书问题时可设为 `false`，此时会关闭 AI 上游 HTTPS 证书校验并输出安全警告。
 - `ai.log_requests`：默认 `false`；设为 `true` 后会把每次发往 AI 上游的完整请求 JSON 写入日志，包括 system、历史、共享记忆、工具定义和 tool results，但不会记录 API Key。日志将包含群聊明文，请谨慎保存。
 - `groups[].id`：传给 wechatauto 的群名或内部 username。
-- `groups[].forward_to`：一个或多个微信联系人。
+- `groups[].forward_to`：一个或多个转发目标；使用微信转发时填写微信中可搜索的备注或昵称，启用 NapCat 时填写 QQ 号。
+- `napcat.enabled`：启用后，`forward_to` 使用 NapCat 私聊发送；目标填写 QQ 号。关闭时兼容原微信发送链路。
+- `napcat.websocket_url`：NapCat OneBot 11 WebSocket 地址，通常为 `ws://127.0.0.1:3001`。
+- `napcat.access_token`：NapCat WebSocket 服务端配置的 Access Token，直接保存在已被 Git 忽略的 `config.json` 中。WebUI 不会回显已保存的 Token，留空保存时保留原值。
 - `groups[].system_prompt_file`：相对配置文件所在目录解析。
 - `groups[].chain.enabled`：是否允许该群自动接龙，默认关闭。
 - `groups[].chain.review_history`：是否在 WebUI“立即回顾历史”时检查并执行匹配的接龙，默认关闭。
@@ -101,6 +104,7 @@ python -m wechat_agent.main --config config.json
 
 - 从微信数据库中的完整群聊目录选择监听群，不需要手动输入群标识。
 - 按群配置 `forward_to`、待确认询问对象、重要性阈值和 Prompt。
+- 配置 NapCat WebSocket，并为每个群维护 QQ 号形式的 `forward_to` 目标。
 - 在群规则中点击“立即回顾历史”，可持久化并立即触发一次基于最近聊天记录的完整 Agent 判断流程。
 - 编辑 Prompt 文件和所有群共享的长期记忆。
 - 查看并人工回答待确认事项；答复写入记忆后，运行中的 Agent 会自动取回并重新评估原消息。

@@ -6,9 +6,30 @@ import unittest
 from pathlib import Path
 
 from wechat_agent.config_manager import ConfigManager
+from wechat_agent.config import load_config
 
 
 class ConfigManagerTests(unittest.TestCase):
+    def test_napcat_token_is_stored_but_not_returned_by_settings(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "config.json"
+            path.write_text(json.dumps({
+                "ai": {"base_url": "https://example", "model": "fake"},
+                "napcat": {"enabled": True, "websocket_url": "ws://127.0.0.1:3001", "access_token": "secret"},
+                "groups": [{"id": "group", "forward_to": ["123"]}],
+            }), encoding="utf-8")
+            manager = ConfigManager(str(path))
+
+            settings = manager.public_settings()["napcat"]
+            self.assertEqual(settings["access_token"], "")
+            self.assertTrue(settings["access_token_configured"])
+            self.assertEqual(load_config(path).napcat.access_token, "secret")
+
+            manager.replace_napcat({"enabled": True, "websocket_url": "ws://localhost:3001", "access_token": ""})
+            saved = json.loads(path.read_text(encoding="utf-8"))["napcat"]
+            self.assertEqual(saved["access_token"], "secret")
+            self.assertNotIn("access_token_env", saved)
+
     def test_group_update_preserves_ai_configuration(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)

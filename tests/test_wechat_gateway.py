@@ -5,7 +5,7 @@ import threading
 import zstandard
 
 from wechat_agent.models import GroupConfig
-from wechat_agent.wechat_gateway import WeChatGateway, decode_wechat_content, normalize_message, send_response_accepted
+from wechat_agent.wechat_gateway import PyWeChatSender, WeChatGateway, decode_wechat_content, normalize_message
 
 
 class FakeListener:
@@ -21,6 +21,8 @@ class FakeListener:
 
 class FakeContactDB:
     def search_contact(self, value):
+        if value == "123@chatroom":
+            return [{"username": value, "nick_name": "测试群", "remark": "群备注"}]
         return [
             {"username": "wxid_direct", "nick_name": value, "remark": ""},
             {"username": "123@chatroom", "nick_name": value, "remark": ""},
@@ -30,14 +32,38 @@ class FakeContactDB:
         return value
 
 
-class SendResponseTests(unittest.TestCase):
-    def test_ui_sent_but_db_unconfirmed_is_accepted_without_retry(self):
-        response = {"status": "失败", "message": "消息已操作发送，但数据库未确认", "data": None}
-        self.assertEqual(send_response_accepted(response), (True, True))
+class FakeMessagesAPI:
+    def __init__(self):
+        self.calls = []
 
-    def test_failure_before_send_remains_retryable(self):
-        response = {"status": "失败", "message": "发送失败：多次重试未完成", "data": None}
-        self.assertEqual(send_response_accepted(response), (False, False))
+    def send_messages_to_friend(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+class FailingMessagesAPI:
+    def send_messages_to_friend(self, **_kwargs):
+        raise RuntimeError("微信窗口不可用")
+
+
+class PyWeChatSenderTests(unittest.TestCase):
+    def test_send_uses_pyweixin_messages_api_without_closing_wechat(self):
+        api = FakeMessagesAPI()
+        sender = PyWeChatSender(api)
+
+        self.assertTrue(sender.send_text("文件传输助手", "测试消息"))
+        self.assertEqual(api.calls, [{
+            "friend": "文件传输助手",
+            "messages": ["测试消息"],
+            "search_pages": 0,
+            "clear": True,
+            "close_weixin": False,
+        }])
+
+    def test_send_error_is_propagated_for_outbox_retry(self):
+        sender = PyWeChatSender(FailingMessagesAPI())
+
+        with self.assertRaisesRegex(RuntimeError, "微信窗口不可用"):
+            sender.send_text("文件传输助手", "测试消息")
 
 
 class MessageDecodingTests(unittest.TestCase):
@@ -109,6 +135,14 @@ class SubscriptionTests(unittest.TestCase):
         gateway.reconfigure((group,))
 
         self.assertEqual(gateway.listener.listeners[0][0], "resolved:group-id")
+
+    def test_send_resolves_internal_group_id_to_visible_name(self):
+        gateway = WeChatGateway.__new__(WeChatGateway)
+        gateway.db = FakeContactDB()
+        gateway.sender = PyWeChatSender(FakeMessagesAPI())
+
+        self.assertTrue(gateway.send_text("123@chatroom", "接龙内容", verify=True))
+        self.assertEqual(gateway.sender._messages_api.calls[0]["friend"], "群备注")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from typing import Any
 from .config import load_config
 from .config_manager import ConfigManager
 from .store import Store
+from .napcat import HybridGateway
 from .wechat_gateway import WeChatGateway
 
 
@@ -17,13 +18,15 @@ class WebContext:
         self.manager = ConfigManager(self.config_path)
         self.config = load_config(self.config_path)
         self.store = Store(self.config.database_path)
-        self._gateway: WeChatGateway | None = gateway
+        self._gateway: Any = gateway
         self._gateway_lock = asyncio.Lock()
 
     async def gateway(self) -> WeChatGateway:
         async with self._gateway_lock:
             if self._gateway is None:
-                self._gateway = await asyncio.to_thread(WeChatGateway, self.config.poll_interval)
+                self._gateway = await asyncio.to_thread(
+                    HybridGateway, self.config.napcat, WeChatGateway(poll_interval=self.config.poll_interval)
+                )
             return self._gateway
 
 
@@ -76,6 +79,15 @@ def create_app(
         except Exception as exc:
             raise api_error(exc)
 
+    @app.put("/api/settings/napcat")
+    async def replace_napcat(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        try:
+            await asyncio.to_thread(context.manager.replace_napcat, payload)
+            hot_reload = await apply_hot_reload()
+            return {"ok": True, "napcat": context.manager.public_settings()["napcat"], "hot_reload": hot_reload}
+        except Exception as exc:
+            raise api_error(exc)
+
     @app.post("/api/groups/{group_id}/evaluate")
     async def evaluate_group_history(group_id: str) -> dict[str, Any]:
         if on_manual_trigger is None:
@@ -94,6 +106,16 @@ def create_app(
     async def wechat_contacts(q: str = Query(default="", max_length=100)) -> list[dict[str, Any]]:
         gateway = await context.gateway()
         return await asyncio.to_thread(gateway.search_contacts, q)
+
+    @app.get("/api/napcat/contacts")
+    async def napcat_contacts() -> list[dict[str, Any]]:
+        gateway = await context.gateway()
+        if not hasattr(gateway, "list_contacts"):
+            return []
+        try:
+            return await asyncio.to_thread(gateway.list_contacts)
+        except Exception as exc:
+            raise api_error(exc)
 
     @app.get("/api/status")
     async def status() -> dict[str, Any]:

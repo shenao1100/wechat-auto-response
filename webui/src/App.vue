@@ -51,7 +51,7 @@ onMounted(async () => {
       <header class="topbar">
         <button class="mobile-menu" @click="sidebarOpen = !sidebarOpen">☰</button>
         <div><span>{{ section }}</span><h1>{{ title }}</h1></div>
-        <div class="topbar-note"><span class="pill neutral">LOCAL</span><small>配置修改后需重启 Agent</small></div>
+         <div class="topbar-note"><span class="pill neutral">LOCAL</span><small>配置修改后自动热更新</small></div>
       </header>
       <div class="page-container"><RouterView /></div>
     </main>

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from wechat_agent.config import load_config
@@ -87,6 +89,32 @@ class ServiceHotReloadTests(unittest.TestCase):
                 self.assertEqual(direct["group_id"], "Bob")
                 self.assertTrue(direct["message"]["_direct_chat"])
                 self.assertEqual(direct["message"]["_direct_target"], "Bob")
+            finally:
+                service.shutdown()
+
+    def test_send_timeout_returns_for_retry(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({
+                "database_path": str(root / "app.db"),
+                "ai": {"base_url": "https://example.invalid/v1", "model": "fake"},
+                "groups": [{"id": "g", "name": "群", "forward_to": ["Alice"]}],
+            }, ensure_ascii=False), encoding="utf-8")
+            gateway = FakeGateway()
+            gateway.send_text = lambda target, text, verify: (time.sleep(2), True)[1]
+            service = AgentService(
+                replace(load_config(config_path), delivery_timeout_seconds=1),
+                gateway=gateway,
+                client=FakeClient(),
+            )
+            try:
+                started = time.monotonic()
+                success, error = service._send_with_timeout("Alice", "hello")
+                elapsed = time.monotonic() - started
+                self.assertFalse(success)
+                self.assertIn("timed out", error)
+                self.assertLess(elapsed, 1.8)
             finally:
                 service.shutdown()
 

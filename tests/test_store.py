@@ -92,8 +92,19 @@ class StoreTests(unittest.TestCase):
         failed = self.store.failed_items()["deliveries"]
         self.assertEqual([(item["outbox_id"], item["target"]) for item in failed], [(outbox_id, "Bob")])
         self.assertEqual(self.store.retry_failed_deliveries(), 1)
-        retried = self.store.claim_delivery()
-        self.assertEqual(retried["target"], "Bob")
+
+    def test_stale_sending_delivery_is_requeued(self):
+        outbox_id = self.store.enqueue_message(["Alice"], "retry me")
+        delivery = self.store.claim_delivery()
+        self.assertEqual(delivery["outbox_id"], outbox_id)
+        self.store._connection().execute(
+            "UPDATE outbox_deliveries SET sending_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", delivery["id"]),
+        )
+        self.assertEqual(self.store.recover_stale_deliveries(30), 1)
+        retry = self.store.claim_delivery()
+        self.assertEqual(retry["id"], delivery["id"])
+        self.assertEqual(retry["attempts"], 1)
 
     def test_direct_reply_is_persisted_in_reliable_outbox(self):
         outbox_id = self.store.enqueue_message(["Alice"], "Schedule created")

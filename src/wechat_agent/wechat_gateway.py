@@ -16,12 +16,6 @@ logger = logging.getLogger(__name__)
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 
-UNCERTAIN_BUT_SENT_MARKERS = (
-    "已操作发送，但数据库未确认",
-    "已操作发送但数据库未确认",
-)
-
-
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -149,31 +143,36 @@ def normalize_message(message: Any) -> dict[str, Any]:
     }
 
 
-def send_response_accepted(response: Any) -> tuple[bool, bool]:
-    """Return (accepted, unverified).
+class PyWeChatSender:
+    """Serialize WeChat 4.1+ UI sends through pywechat127's pyweixin API."""
 
-    WeChat GUI sends are not idempotent. If the UI action completed but the local
-    DB has not confirmed it yet, retrying can send the same text twice. Such a
-    response is accepted with an unverified marker to provide at-most-once
-    behavior. Failures before the send action remain retryable.
-    """
-    if isinstance(response, bool):
-        return response, False
-    message = ""
-    if isinstance(response, dict):
-        message = str(response.get("message") or "")
-    elif hasattr(response, "message"):
-        message = str(response.message or "")
-    if any(marker in message for marker in UNCERTAIN_BUT_SENT_MARKERS):
-        return True, True
-    if isinstance(response, dict) and response.get("status") is not None:
-        return str(response.get("status")) == "成功", False
-    if hasattr(response, "is_success"):
-        marker = response.is_success
-        return bool(marker() if callable(marker) else marker), False
-    if hasattr(response, "success") and not callable(response.success):
-        return bool(response.success), False
-    return bool(response), False
+    def __init__(self, messages_api: Any | None = None):
+        self._messages_api = messages_api
+        self._send_lock = threading.Lock()
+
+    def _api(self) -> Any:
+        if self._messages_api is None:
+            from pyweixin import Messages
+
+            self._messages_api = Messages
+        return self._messages_api
+
+    def send_text(self, target: str, text: str) -> bool:
+        if not target.strip():
+            raise ValueError("WeChat send target must not be empty")
+        if not text:
+            raise ValueError("WeChat message must not be empty")
+        # pywechat UI automation must not operate on the same WeChat window
+        # concurrently. A normal return means the send keystroke completed.
+        with self._send_lock:
+            self._api().send_messages_to_friend(
+                friend=target,
+                messages=[text],
+                search_pages=0,
+                clear=True,
+                close_weixin=False,
+            )
+        return True
 
 
 class Gateway(Protocol):
@@ -182,12 +181,18 @@ class Gateway(Protocol):
 
 
 class WeChatGateway:
-    def __init__(self, poll_interval: float = 1.0, account: str | None = None):
+    def __init__(
+        self,
+        poll_interval: float = 1.0,
+        account: str | None = None,
+        sender: PyWeChatSender | None = None,
+    ):
         from wechatauto import WeChatDB
         from wechatauto.db import Listener
 
         self.db = WeChatDB(account=account)
         self.listener = Listener(self.db, interval=poll_interval)
+        self.sender = sender or PyWeChatSender()
         self._resolved_users: dict[str, str] = {}
         self._sender_names: dict[str, str] = {}
         self._subscription_lock = threading.RLock()
@@ -461,14 +466,34 @@ class WeChatGateway:
         ]
 
     def send_text(self, target: str, text: str, verify: bool) -> bool:
-        from wechatauto.guia import quick_send
+        # Keep the legacy verify argument so existing configuration and gateway
+        # test doubles remain compatible. pywechat has no DB verification API.
+        del verify
+        send_target = self._pywechat_target(target)
+        logger.info("Sending WeChat text through pywechat target=%s", send_target)
+        return self.sender.send_text(send_target, text)
 
-        response = quick_send(text, target, verify=verify)
-        accepted, unverified = send_response_accepted(response)
-        if unverified:
-            logger.warning(
-                "WeChat completed the UI send to %s but DB verification timed out; "
-                "accepting it without retry to prevent duplicate delivery",
-                target,
+    def _pywechat_target(self, target: str) -> str:
+        """Translate a DB username to the visible name required by pywechat."""
+        if not target.endswith("@chatroom") and not target.startswith("wxid_"):
+            return target
+        try:
+            exact = next(
+                (
+                    item for item in self.db.search_contact(target)
+                    if str(item.get("username") or "") == target
+                ),
+                None,
             )
-        return accepted
+            if exact is not None:
+                visible = str(exact.get("remark") or exact.get("nick_name") or "").strip()
+                if visible:
+                    return visible
+            visible = str(self.db.get_nickname(target) or "").strip()
+            if visible and visible != target:
+                return visible
+        except Exception:
+            logger.exception("Failed to resolve pywechat display name for %s", target)
+        raise RuntimeError(
+            f"pywechat requires a visible WeChat remark or nickname; cannot resolve {target!r}"
+        )

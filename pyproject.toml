@@ -7,7 +7,12 @@ name = "wechat-important-agent"
 version = "0.1.0"
 description = "Agentic WeChat group monitor that forwards important events"
 requires-python = ">=3.10"
-dependencies = ["wechatauto-replica>=1.1.9", "zstandard>=0.23,<1"]
+dependencies = [
+    "wechatauto-replica>=1.1.9",
+    "pywechat127>=1.9.8,<2",
+    "zstandard>=0.23,<1",
+    "websocket-client>=1.8,<2",
+]
 
 [project.optional-dependencies]
 web = ["fastapi>=0.116,<1", "uvicorn>=0.35,<1"]
