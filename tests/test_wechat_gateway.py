@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-import unittest
 import threading
+import unittest
+
 import zstandard
 
 from wechat_agent.models import GroupConfig
-from wechat_agent.wechat_gateway import PyWeChatSender, WeChatGateway, decode_wechat_content, normalize_message
+from wechat_agent.wechat_gateway import (
+    ReplicaWeChatSender,
+    SendMayHaveCompletedError,
+    WeChatGateway,
+    decode_wechat_content,
+    normalize_message,
+)
 
 
 class FakeListener:
@@ -22,7 +29,7 @@ class FakeListener:
 class FakeContactDB:
     def search_contact(self, value):
         if value == "123@chatroom":
-            return [{"username": value, "nick_name": "测试群", "remark": "群备注"}]
+            return [{"username": value, "nick_name": "Test Group", "remark": "Group Remark"}]
         return [
             {"username": "wxid_direct", "nick_name": value, "remark": ""},
             {"username": "123@chatroom", "nick_name": value, "remark": ""},
@@ -32,38 +39,49 @@ class FakeContactDB:
         return value
 
 
-class FakeMessagesAPI:
+class FakeReplicaGUI:
     def __init__(self):
         self.calls = []
 
-    def send_messages_to_friend(self, **kwargs):
-        self.calls.append(kwargs)
+    def send_msg(self, text, who=None, verify=False):
+        self.calls.append({"text": text, "who": who, "verify": verify})
+        return {"status": "success", "message": "sent"}
 
 
-class FailingMessagesAPI:
-    def send_messages_to_friend(self, **_kwargs):
-        raise RuntimeError("微信窗口不可用")
+class FailingReplicaGUI:
+    def send_msg(self, _text, who=None, verify=False):
+        raise RuntimeError("WeChat window unavailable")
 
 
-class PyWeChatSenderTests(unittest.TestCase):
-    def test_send_uses_pyweixin_messages_api_without_closing_wechat(self):
-        api = FakeMessagesAPI()
-        sender = PyWeChatSender(api)
+class ReplicaWeChatSenderTests(unittest.TestCase):
+    def test_send_uses_replica_gui_with_database_verification(self):
+        gui = FakeReplicaGUI()
+        sender = ReplicaWeChatSender(lambda: gui)
 
-        self.assertTrue(sender.send_text("文件传输助手", "测试消息"))
-        self.assertEqual(api.calls, [{
-            "friend": "文件传输助手",
-            "messages": ["测试消息"],
-            "search_pages": 0,
-            "clear": True,
-            "close_weixin": False,
-        }])
+        self.assertTrue(sender.send_text("File Transfer", "test message"))
+        self.assertEqual(gui.calls, [{"text": "test message", "who": "File Transfer", "verify": True}])
 
     def test_send_error_is_propagated_for_outbox_retry(self):
-        sender = PyWeChatSender(FailingMessagesAPI())
+        sender = ReplicaWeChatSender(lambda: FailingReplicaGUI())
 
-        with self.assertRaisesRegex(RuntimeError, "微信窗口不可用"):
-            sender.send_text("文件传输助手", "测试消息")
+        with self.assertRaisesRegex(RuntimeError, "window unavailable"):
+            sender.send_text("File Transfer", "test message")
+
+    def test_failed_replica_response_is_propagated_for_outbox_retry(self):
+        class FailedResponseGUI:
+            def send_msg(self, _text, who=None, verify=False):
+                return {"status": "failure", "message": "not verified"}
+
+        with self.assertRaisesRegex(RuntimeError, "not verified"):
+            ReplicaWeChatSender(FailedResponseGUI).send_text("File Transfer", "test message")
+
+    def test_unverified_post_send_response_is_not_safe_to_retry(self):
+        class UnverifiedResponseGUI:
+            def send_msg(self, text, who=None, verify=False):
+                return {"status": "failure", "message": "unverified", "data": {"content": text}}
+
+        with self.assertRaises(SendMayHaveCompletedError):
+            ReplicaWeChatSender(UnverifiedResponseGUI).send_text("File Transfer", "test message")
 
 
 class MessageDecodingTests(unittest.TestCase):
@@ -73,28 +91,25 @@ class MessageDecodingTests(unittest.TestCase):
         self.assertEqual(message["id"], 987654)
 
     def test_zstd_text_restores_sender_and_body(self):
-        compressed = zstandard.ZstdCompressor().compress(
-            "wxid_sender:\n@所有人 明天十点在 M103 开班会".encode("utf-8")
-        )
+        compressed = zstandard.ZstdCompressor().compress(b"wxid_sender:\nmeeting at 10")
 
-        sender, content = decode_wechat_content(compressed, "文本")
+        sender, content = decode_wechat_content(compressed, "text")
 
         self.assertEqual(sender, "wxid_sender")
-        self.assertEqual(content, "@所有人 明天十点在 M103 开班会")
+        self.assertEqual(content, "meeting at 10")
 
     def test_zstd_card_is_summarized_instead_of_returning_placeholder(self):
         xml = """wxid_sender:
-<?xml version="1.0"?><msg><appmsg><title>班会时间调整</title>
-<des>改到明天十点</des><url>https://example.com/notice</url></appmsg></msg>"""
+<?xml version="1.0"?><msg><appmsg><title>Meeting update</title>
+<des>Moved to 10 AM</des><url>https://example.com/notice</url></appmsg></msg>"""
         compressed = zstandard.ZstdCompressor().compress(xml.encode("utf-8"))
 
-        sender, content = decode_wechat_content(compressed, "文件/链接/卡片")
+        sender, content = decode_wechat_content(compressed, "card")
 
         self.assertEqual(sender, "wxid_sender")
-        self.assertIn("班会时间调整", content)
-        self.assertIn("改到明天十点", content)
+        self.assertIn("Meeting update", content)
+        self.assertIn("Moved to 10 AM", content)
         self.assertIn("https://example.com/notice", content)
-        self.assertNotEqual(content, "[文件/链接/卡片]")
 
 
 class SubscriptionTests(unittest.TestCase):
@@ -139,10 +154,11 @@ class SubscriptionTests(unittest.TestCase):
     def test_send_resolves_internal_group_id_to_visible_name(self):
         gateway = WeChatGateway.__new__(WeChatGateway)
         gateway.db = FakeContactDB()
-        gateway.sender = PyWeChatSender(FakeMessagesAPI())
+        gui = FakeReplicaGUI()
+        gateway.sender = ReplicaWeChatSender(lambda: gui)
 
-        self.assertTrue(gateway.send_text("123@chatroom", "接龙内容", verify=True))
-        self.assertEqual(gateway.sender._messages_api.calls[0]["friend"], "群备注")
+        self.assertTrue(gateway.send_text("123@chatroom", "relay content", verify=True))
+        self.assertEqual(gui.calls[0]["who"], "Group Remark")
 
 
 if __name__ == "__main__":

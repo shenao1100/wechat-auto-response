@@ -21,7 +21,7 @@ from .models import AppConfig, MessageBatch
 from .napcat import HybridGateway
 from .store import Store
 from .timeutils import get_timezone
-from .wechat_gateway import Gateway, WeChatGateway
+from .wechat_gateway import Gateway, SendMayHaveCompletedError, WeChatGateway
 
 logger = logging.getLogger(__name__)
 
@@ -185,16 +185,23 @@ class AgentService:
         if not inserted:
             logger.debug("Ignored duplicate direct message target=%s key=%s", target, raw_key)
             return
+        self.store.record_direct_message(
+            direct_group.id,
+            str(payload.get("_channel") or "wechat"),
+            target,
+            "incoming",
+            content,
+        )
         payload["_inbox_id"] = inbox_id
         self._queue_incoming(direct_group, payload)
         logger.info("New direct chat message from forward_to=%s", target)
 
-    @staticmethod
-    def _direct_group(target: str) -> Any:
+    def _direct_group(self, target: str) -> Any:
         from .models import GroupConfig
 
+        context = dict(self.config.direct_contexts).get(target, target)
         return GroupConfig(
-            id=target,
+            id=f"direct:{context}",
             name=f"私聊 · {target}",
             forward_to=(target,),
             system_prompt="forward_to 私聊是受信任的用户对话。帮助用户管理日程、提醒和共享长期记忆，并明确回复操作结果。",
@@ -318,8 +325,7 @@ class AgentService:
             if now - last_recovery >= 5.0:
                 recovered = self.store.recover_stale_deliveries(self.config.delivery_timeout_seconds)
                 if recovered:
-                    logger.warning("Recovered %d stale sending deliveries; queued for retry", recovered)
-                    self.outbound_wake.set()
+                    logger.warning("Marked %d stale sending deliveries failed because their outcomes are uncertain", recovered)
                 last_recovery = now
             delivery = self.store.claim_delivery()
             if delivery is None:
@@ -333,7 +339,10 @@ class AgentService:
             success, error = self._send_with_timeout(target, str(delivery["text"]))
             if success:
                 logger.info("Sent delivery id=%s to %s", delivery["id"], target)
-            status = self.store.finish_delivery(int(delivery["id"]), success, error)
+            may_have_sent = error.startswith(("send may have completed: ", "send timed out after "))
+            status = self.store.finish_delivery(
+                int(delivery["id"]), success, error, max_attempts=1 if may_have_sent else 5
+            )
             if not success:
                 logger.warning("Delivery id=%s target=%s outbox_status=%s", delivery["id"], target, status)
                 self.stop_event.wait(min(30, 2 ** min(5, int(delivery["attempts"]))))
@@ -347,6 +356,9 @@ class AgentService:
                 result["success"] = bool(self.gateway.send_text(target, text, self.config.send_verify))
                 if not result["success"]:
                     result["error"] = "send returned failure"
+            except SendMayHaveCompletedError as exc:
+                result["error"] = f"send may have completed: {exc}"[:2000]
+                logger.warning("Send outcome is uncertain target=%s: %s", target, exc)
             except Exception as exc:
                 result["error"] = str(exc)[:2000]
                 logger.exception("Send failed target=%s", target)
@@ -356,14 +368,14 @@ class AgentService:
         threading.Thread(target=send_worker, name=f"send-{target}", daemon=True).start()
         if not finished.wait(max(1.0, self.config.delivery_timeout_seconds)):
             error = f"send timed out after {self.config.delivery_timeout_seconds:g}s"
-            logger.error("Send timed out target=%s; delivery will be retried", target)
+            logger.error("Send timed out target=%s; outcome is uncertain and must not be retried automatically", target)
             return False, error
         return bool(result["success"]), str(result["error"])
 
     def _schedule_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                queued = self.store.queue_schedule_outbox()
+                queued = self.store.queue_schedule_outbox(default_timezone_name=self.config.timezone)
                 if queued:
                     logger.info("Queued %d due schedules into outbox", len(queued))
                     self.outbound_wake.set()

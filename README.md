@@ -1,6 +1,6 @@
 # 微信群重要信息 Agent
 
-监听指定微信群，将新消息、近期历史、群聊专属提示词和长期记忆交给 OpenAI-compatible 上游。模型可以通过 tool call 获取更长历史、读写记忆、查询近期转发、创建/查看/取消日程以及转发重要信息。`forward_to` 目标可通过 NapCat OneBot 11 WebSocket 接收私聊并发送通知。
+监听指定微信群，将新消息、近期历史、群聊专属提示词和长期记忆交给 OpenAI-compatible 上游。模型可以通过 tool call 获取更长历史、读写记忆、搜索公开网页、创建/查看/修改/取消日程以及转发重要信息。`forward_to` 目标可通过微信或 NapCat OneBot 11 WebSocket 接收私聊并发送通知。
 
 ## 运行模型
 
@@ -24,8 +24,11 @@
 - `get_chat_history`：最多补取 200 条历史，可用 offset 分页。
 - `get_memory` / `remember`：读取或维护所有监听群共享的长期记忆。
 - `get_recent_forwarded`：检查近期通知，帮助避免语义重复。
-- `schedule_reminder`：创建明确的未来提醒。
-- `list_schedules` / `cancel_schedule`：管理全局共享日程；所有监听群和 `forward_to` 私聊都能查询或取消同一份日程。
+- `schedule_reminder`：创建明确的未来提醒，返回可用于后续管理的日程编号。
+- `list_schedules` / `update_schedule` / `cancel_schedule`：查询、修改或取消全局共享日程，并返回本地时间、状态和接收人。
+- `calculator` / `date_time` / `convert_units`：安全计算、日期时间处理和单位换算。
+- `calculate_hash` / `generate_random` / `encode_decode`：哈希、安全随机值与 URL/Base64 编解码。
+- `web_search` / `fetch_web_pages`：搜索公开网页并提取正文；拒绝内网地址、危险重定向和超大响应，网页内容始终按不可信数据处理。
 - `forward_important`：将摘要放入串行微信发送队列，但不终止 Agent。
 - `ask_forward_target`：只有在判断确实缺少用户偏好或背景时，向 `forward_to` 询问；答复会写入长期记忆并触发原消息重新评估。
 - `reply_to_sender`：仅用于 `forward_to` 私聊，回复日程操作结果、普通问答或需要用户补充的信息。
@@ -35,13 +38,34 @@
 
 SQLite 保存长期记忆、转发事件、日程、Agent 审计记录以及持久化 inbox/outbox。微信发送始终由一个线程串行执行；每个目标联系人独立记录投递状态，某个联系人失败不会让已经成功的联系人重复收到通知。
 
-微信 GUI 发送由 `pywechat127` 的微信 4.1+ `pyweixin.Messages` 接口执行，并在进程内串行操作微信窗口。`pywechat` 正常返回时视为发送成功；若调用抛出异常，可靠 outbox 会按既有策略重试。
+微信监听、历史读取和 GUI 发信均由本地 `wechatauto-replica` 源码执行。发信前记录当前会话数据库游标，操作微信窗口后最多等待 20 秒确认一条更新的本人消息，避免把历史同文消息误认为本次发送成功。发送结果无法确认时会标记为失败且不自动重发，防止实际已发送却因数据库延迟产生重复消息。
 
 监听消息会先写入 inbox，再进入内存聚合器；Agent 正常给出 `FINAL_DECISION` 后才标记完成。进程意外退出时，未完成消息会在下次启动自动重放。重要事件记录与 outbox 任务在同一 SQLite 事务中创建，避免出现“记录成已转发，但发送任务实际丢失”的状态。
 
 ## 安装
 
-要求 Windows 10/11、Python 3.10+、已登录的微信 4.1.12+。项目使用 `wechatauto-replica>=1.1.9` 监听和读取消息，使用 `pywechat127>=1.9.8` 提供的 `pyweixin` 接口执行微信发信。
+要求 Windows 10/11、Python 3.10+、已登录的微信 4.1.12+；当前实际测试版本为微信 4.1.13.12。
+
+项目的发送可靠性修复位于 `wechatauto-replica` fork 的 `fix/mtime-ns-v1.1.9` 分支。请将它克隆到本项目根目录，并保持目录名为 `wechatauto-replica`：
+
+```powershell
+git clone --branch fix/mtime-ns-v1.1.9 --single-branch `
+  https://github.com/shenao1100/wechatauto-replica.git `
+  wechatauto-replica
+```
+
+最终目录结构应为：
+
+```text
+wechat-auto-resp/
+├─ start.cmd
+├─ config.json
+├─ src/
+└─ wechatauto-replica/
+   └─ wechatauto/
+```
+
+`start.cmd` 会把这个目录放到 `PYTHONPATH` 最前面，因此运行时使用的是本地修复版，而不是环境中可能安装的 PyPI 版本。`pyproject.toml` 中的 `wechatauto-replica` 依赖仅用于安装其余运行依赖和提供兼容回退。
 
 ```powershell
 python -m pip install -e ".[web]"
@@ -83,14 +107,23 @@ python -m wechat_agent.main --config config.json --list-sessions
 
 ## 启动
 
+推荐编辑已被 Git 忽略的 `start.cmd`，在其中设置本机 API Key，然后直接运行：
+
+```powershell
+.\start.cmd
+```
+
+如需绕过脚本手工启动，必须同时加入本地 replica 源码：
+
 PowerShell 当前窗口设置密钥并运行：
 
 ```powershell
 $env:AI_API_KEY = "你的密钥"
+$env:PYTHONPATH = "$PWD\wechatauto-replica;$env:PYTHONPATH"
 python -m wechat_agent.main --config config.json
 ```
 
-保持微信登录且桌面未锁定。消息读取可在后台进行，但转发依赖微信桌面 UI。
+保持微信登录且桌面未锁定。消息读取可在后台进行，但转发依赖微信桌面 UI；RDP 断开后若 Windows 图形会话不可用，微信 GUI 发信仍可能失败。
 
 ## WebUI
 
@@ -151,7 +184,7 @@ python -m wechat_agent.main --config config.json --retry-failed
 
 ## 安全边界
 
-群消息被视为不可信数据。基础提示词明确禁止群消息修改 Agent 规则或诱导调用工具。API Key 只从环境变量读取，不写入配置、SQLite 或日志。正式使用前建议先将 `forward_to` 设为“文件传输助手”观察判断效果。
+群消息和网页内容都被视为不可信数据。基础提示词明确禁止它们修改 Agent 规则、诱导无关工具调用或索取密钥。API Key 由被 Git 忽略的本地 `start.cmd` 写入当前进程环境，不进入 `config.json`、SQLite、日志或版本库。正式使用前建议先将 `forward_to` 设为“文件传输助手”观察判断效果。
 
 ## 测试
 

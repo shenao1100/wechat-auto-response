@@ -10,3 +10,11 @@ wechatauto_logs/
 webui/node_modules/
 webui/.vite/
 start.cmd
+
+# Local source dependencies and reference repositories
+/wechatauto-replica/
+/sse-proxy-python/
+/pywechat/
+
+# Local message samples may contain personal information
+/eg.txt

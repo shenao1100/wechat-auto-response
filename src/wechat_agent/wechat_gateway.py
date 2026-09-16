@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 
+class SendMayHaveCompletedError(RuntimeError):
+    """The UI accepted Send but the database could not confirm the outcome."""
+
+
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -143,35 +147,49 @@ def normalize_message(message: Any) -> dict[str, Any]:
     }
 
 
-class PyWeChatSender:
-    """Serialize WeChat 4.1+ UI sends through pywechat127's pyweixin API."""
+class ReplicaWeChatSender:
+    """Serialize WeChat UI sends through the local wechatauto-replica source."""
 
-    def __init__(self, messages_api: Any | None = None):
-        self._messages_api = messages_api
+    def __init__(self, gui_factory: Callable[[], Any] | None = None):
+        self._gui_factory = gui_factory
         self._send_lock = threading.Lock()
 
-    def _api(self) -> Any:
-        if self._messages_api is None:
-            from pyweixin import Messages
+    def _new_gui(self) -> Any:
+        if self._gui_factory is None:
+            from wechatauto.guia import WeChatGUI
 
-            self._messages_api = Messages
-        return self._messages_api
+            return WeChatGUI()
+        return self._gui_factory()
 
-    def send_text(self, target: str, text: str) -> bool:
+    def send_text(self, target: str, text: str, verify: bool = True) -> bool:
         if not target.strip():
             raise ValueError("WeChat send target must not be empty")
         if not text:
             raise ValueError("WeChat message must not be empty")
-        # pywechat UI automation must not operate on the same WeChat window
-        # concurrently. A normal return means the send keystroke completed.
+        # The delivery service invokes this from a short-lived worker thread.
+        # Build the GUI driver in that thread so its UI Automation state is not
+        # reused across COM apartments or after a WeChat window recreation.
         with self._send_lock:
-            self._api().send_messages_to_friend(
-                friend=target,
-                messages=[text],
-                search_pages=0,
-                clear=True,
-                close_weixin=False,
-            )
+            response = self._new_gui().send_msg(text, who=target, verify=verify)
+        response_ok = bool(response)
+        # WxResponse exposes ``is_success``. The mapping fallback keeps a
+        # failed adapter/test response from being treated as truthy merely
+        # because it contains fields.
+        if hasattr(response, "is_success"):
+            response_ok = bool(response.is_success)
+        elif isinstance(response, dict) and response.get("status") in {"failure", "error"}:
+            response_ok = False
+        if not response_ok:
+            message = response.get("message") if isinstance(response, dict) else str(response)
+            data = response.get("data") if isinstance(response, dict) else None
+            # replica only attaches the submitted content to its post-send
+            # verification failure. Retrying that state can duplicate a chat
+            # message, so leave it for explicit human confirmation instead.
+            if isinstance(data, dict) and data.get("content") == text:
+                raise SendMayHaveCompletedError(
+                    f"wechatauto-replica may have sent the message but could not verify it: {message}"
+                )
+            raise RuntimeError(f"wechatauto-replica send failed: {message}")
         return True
 
 
@@ -185,20 +203,21 @@ class WeChatGateway:
         self,
         poll_interval: float = 1.0,
         account: str | None = None,
-        sender: PyWeChatSender | None = None,
+        sender: ReplicaWeChatSender | None = None,
     ):
         from wechatauto import WeChatDB
         from wechatauto.db import Listener
 
         self.db = WeChatDB(account=account)
         self.listener = Listener(self.db, interval=poll_interval)
-        self.sender = sender or PyWeChatSender()
+        self.sender = sender or ReplicaWeChatSender()
         self._resolved_users: dict[str, str] = {}
         self._sender_names: dict[str, str] = {}
         self._subscription_lock = threading.RLock()
         self._subscriptions: list[tuple[str, Callable[..., None]]] = []
         self._group_callback: Callable[[GroupConfig, dict[str, Any]], None] | None = None
         self._direct_callback: Callable[[str, dict[str, Any]], None] | None = None
+        self._direct_targets: tuple[str, ...] | None = None
 
     def resolve_user(self, value: str) -> str:
         cached = self._resolved_users.get(value)
@@ -228,16 +247,20 @@ class WeChatGateway:
         groups: tuple[GroupConfig, ...],
         callback: Callable[[GroupConfig, dict[str, Any]], None],
         direct_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        direct_targets: tuple[str, ...] | None = None,
     ) -> None:
         self._group_callback = callback
         self._direct_callback = direct_callback
+        self._direct_targets = direct_targets
         self.reconfigure(groups)
         self.listener.start()
 
-    def reconfigure(self, groups: tuple[GroupConfig, ...]) -> None:
+    def reconfigure(self, groups: tuple[GroupConfig, ...], direct_targets: tuple[str, ...] | None = None) -> None:
         """Replace live subscriptions without resetting listener watermarks."""
         if self._group_callback is None:
             raise RuntimeError("gateway must be started before it can be reconfigured")
+        if direct_targets is not None:
+            self._direct_targets = direct_targets
         callback = self._group_callback
         direct_callback = self._direct_callback
         with self._subscription_lock:
@@ -269,7 +292,11 @@ class WeChatGateway:
                 logger.info("Listening to group %s (%s)", group.name, group.id)
 
             if direct_callback is not None:
-                targets = dict.fromkeys(target for group in groups if group.enabled for target in group.forward_to)
+                targets = dict.fromkeys(
+                    self._direct_targets
+                    if self._direct_targets is not None
+                    else (target for group in groups if group.enabled for target in group.forward_to)
+                )
                 for target in targets:
                     target_user = self.resolve_user(target)
                     if target_user in listened_users:
@@ -466,15 +493,12 @@ class WeChatGateway:
         ]
 
     def send_text(self, target: str, text: str, verify: bool) -> bool:
-        # Keep the legacy verify argument so existing configuration and gateway
-        # test doubles remain compatible. pywechat has no DB verification API.
-        del verify
-        send_target = self._pywechat_target(target)
-        logger.info("Sending WeChat text through pywechat target=%s", send_target)
-        return self.sender.send_text(send_target, text)
+        send_target = self._visible_send_target(target)
+        logger.info("Sending WeChat text through wechatauto-replica target=%s verify=%s", send_target, verify)
+        return self.sender.send_text(send_target, text, verify=verify)
 
-    def _pywechat_target(self, target: str) -> str:
-        """Translate a DB username to the visible name required by pywechat."""
+    def _visible_send_target(self, target: str) -> str:
+        """Translate a database username to a searchable visible chat name."""
         if not target.endswith("@chatroom") and not target.startswith("wxid_"):
             return target
         try:
@@ -493,7 +517,7 @@ class WeChatGateway:
             if visible and visible != target:
                 return visible
         except Exception:
-            logger.exception("Failed to resolve pywechat display name for %s", target)
+            logger.exception("Failed to resolve visible chat name for %s", target)
         raise RuntimeError(
-            f"pywechat requires a visible WeChat remark or nickname; cannot resolve {target!r}"
+            f"WeChat UI sender requires a visible remark or nickname; cannot resolve {target!r}"
         )

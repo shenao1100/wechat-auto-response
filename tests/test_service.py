@@ -9,6 +9,7 @@ from pathlib import Path
 
 from wechat_agent.config import load_config
 from wechat_agent.service import AgentService
+from wechat_agent.wechat_gateway import SendMayHaveCompletedError
 
 
 class FakeGateway:
@@ -86,13 +87,13 @@ class ServiceHotReloadTests(unittest.TestCase):
 
                 service.on_direct_message("Bob", {"id": 88, "time": 123, "content": "明天九点提醒我交材料"})
                 direct = service.store.pending_incoming()[-1]
-                self.assertEqual(direct["group_id"], "Bob")
+                self.assertEqual(direct["group_id"], "direct:Bob")
                 self.assertTrue(direct["message"]["_direct_chat"])
                 self.assertEqual(direct["message"]["_direct_target"], "Bob")
             finally:
                 service.shutdown()
 
-    def test_send_timeout_returns_for_retry(self):
+    def test_send_timeout_returns_an_uncertain_failure(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             config_path = root / "config.json"
@@ -115,6 +116,51 @@ class ServiceHotReloadTests(unittest.TestCase):
                 self.assertFalse(success)
                 self.assertIn("timed out", error)
                 self.assertLess(elapsed, 1.8)
+            finally:
+                service.shutdown()
+
+    def test_timeout_is_marked_failed_without_an_automatic_retry(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({
+                "database_path": str(root / "app.db"),
+                "ai": {"base_url": "https://example.invalid/v1", "model": "fake"},
+                "groups": [{"id": "g", "name": "group", "forward_to": ["Alice"]}],
+            }), encoding="utf-8")
+            gateway = FakeGateway()
+            service = AgentService(load_config(config_path), gateway=gateway, client=FakeClient())
+            try:
+                service.store.enqueue_message(["Alice"], "hello")
+                delivery = service.store.claim_delivery()
+                error = "send timed out after 60s"
+                status = service.store.finish_delivery(delivery["id"], False, error, max_attempts=1)
+                self.assertEqual(status, "failed")
+                self.assertIsNone(service.store.claim_delivery())
+            finally:
+                service.shutdown()
+
+    def test_uncertain_send_is_marked_failed_without_retry(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({
+                "database_path": str(root / "app.db"),
+                "ai": {"base_url": "https://example.invalid/v1", "model": "fake"},
+                "groups": [{"id": "g", "name": "group", "forward_to": ["Alice"]}],
+            }), encoding="utf-8")
+            gateway = FakeGateway()
+            gateway.send_text = lambda target, text, verify: (_ for _ in ()).throw(SendMayHaveCompletedError("unverified"))
+            service = AgentService(load_config(config_path), gateway=gateway, client=FakeClient())
+            try:
+                outbox_id = service.store.enqueue_message(["Alice"], "hello")
+                delivery = service.store.claim_delivery()
+                success, error = service._send_with_timeout("Alice", "hello")
+                self.assertFalse(success)
+                self.assertTrue(error.startswith("send may have completed: "))
+                self.assertEqual(service.store.finish_delivery(delivery["id"], success, error, max_attempts=1), "failed")
+                self.assertEqual(service.store.claim_delivery(), None)
+                self.assertEqual(outbox_id, 1)
             finally:
                 service.shutdown()
 

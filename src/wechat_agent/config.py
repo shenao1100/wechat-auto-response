@@ -53,6 +53,14 @@ def load_config(path: str | Path) -> AppConfig:
         reconnect_seconds=max(1.0, float(napcat_raw.get("reconnect_seconds", 5))),
         request_timeout_seconds=max(5.0, float(napcat_raw.get("request_timeout_seconds", 30))),
     )
+    direct_contexts_raw = raw.get("direct_contexts") or {}
+    if not isinstance(direct_contexts_raw, dict):
+        raise ConfigError("direct_contexts must be an object mapping channel targets to context ids")
+    direct_contexts = tuple(sorted(
+        (str(target).strip(), str(context).strip())
+        for target, context in direct_contexts_raw.items()
+        if str(target).strip() and str(context).strip()
+    ))
     groups: list[GroupConfig] = []
     for index, item in enumerate(raw.get("groups") or []):
         location = f"groups[{index}]"
@@ -128,6 +136,7 @@ def load_config(path: str | Path) -> AppConfig:
         ai=ai,
         groups=tuple(groups),
         napcat=napcat,
+        direct_contexts=direct_contexts,
         timezone=str(raw.get("timezone", "Asia/Shanghai")),
         database_path=relative_path(str(raw.get("database_path", "data/app.db"))),
         log_path=relative_path(str(raw.get("log_path", "logs/app.log"))),

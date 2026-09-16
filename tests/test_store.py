@@ -29,6 +29,8 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(self.store.queue_schedule_outbox()), 1)
         delivery = self.store.claim_delivery()
         self.assertEqual(delivery["target"], "filehelper")
+        self.assertIn(f"日程提醒 #{schedule_id}", delivery["text"])
+        self.assertIn("提醒时间：", delivery["text"])
         self.assertEqual(self.store.finish_delivery(delivery["id"], True), "sent")
         schedules = self.store.list_schedules("g1", include_done=True)
         self.assertEqual(schedules[0]["id"], schedule_id)
@@ -47,6 +49,66 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(duplicate_from_other_group, schedule_id)
         self.assertTrue(cancelled_from_other_group)
         self.assertEqual(self.store.list_schedules(None, include_done=True)[0]["status"], "cancelled")
+
+    def test_pending_schedule_can_be_updated_and_filtered(self):
+        first_time = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        second_time = (datetime.now(timezone.utc) + timedelta(days=4)).isoformat()
+        schedule_id = self.store.add_schedule(
+            "group-a", "Original", "Old content", first_time, ["Alice"], "Asia/Shanghai"
+        )
+
+        self.assertTrue(
+            self.store.update_schedule(
+                schedule_id, "Updated", "New content", second_time, "Asia/Shanghai"
+            )
+        )
+        updated = self.store.get_schedule(schedule_id)
+        self.assertEqual(updated["title"], "Updated")
+        self.assertEqual(updated["run_at"], second_time)
+        self.assertEqual(updated["timezone_name"], "Asia/Shanghai")
+        self.assertEqual(len(self.store.list_schedules(status="pending", limit=1)), 1)
+        self.assertEqual(self.store.list_schedules(status="sent"), [])
+
+        self.assertTrue(self.store.cancel_schedule(None, schedule_id))
+        self.assertFalse(
+            self.store.update_schedule(
+                schedule_id, "Too late", "No change", second_time, "Asia/Shanghai"
+            )
+        )
+
+    def test_legacy_schedule_uses_configured_timezone_after_migration(self):
+        legacy_path = Path(self.tempdir.name) / "legacy.db"
+        connection = sqlite3.connect(legacy_path)
+        connection.execute(
+            """CREATE TABLE schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                run_at TEXT NOT NULL,
+                targets_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO schedules
+               (group_id, title, content, run_at, targets_json, created_at)
+               VALUES ('g1', 'Legacy', 'Old reminder', '2026-01-01T01:00:00+00:00', '["Alice"]',
+                       '2025-01-01T00:00:00+00:00')"""
+        )
+        connection.commit()
+        connection.close()
+
+        legacy_store = Store(str(legacy_path))
+        try:
+            self.assertEqual(legacy_store.get_schedule(1)["timezone_name"], "")
+            legacy_store.queue_schedule_outbox(default_timezone_name="Asia/Shanghai")
+            delivery = legacy_store.claim_delivery()
+            self.assertIn("2026-01-01 09:00 (Asia/Shanghai)", delivery["text"])
+        finally:
+            legacy_store.close()
 
     def test_inbox_survives_and_can_be_retried(self):
         inbox_id, inserted = self.store.save_incoming("g1", "m1", {"content": "hello"})
@@ -93,7 +155,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([(item["outbox_id"], item["target"]) for item in failed], [(outbox_id, "Bob")])
         self.assertEqual(self.store.retry_failed_deliveries(), 1)
 
-    def test_stale_sending_delivery_is_requeued(self):
+    def test_stale_sending_delivery_is_not_retried(self):
         outbox_id = self.store.enqueue_message(["Alice"], "retry me")
         delivery = self.store.claim_delivery()
         self.assertEqual(delivery["outbox_id"], outbox_id)
@@ -102,9 +164,9 @@ class StoreTests(unittest.TestCase):
             ("2000-01-01T00:00:00+00:00", delivery["id"]),
         )
         self.assertEqual(self.store.recover_stale_deliveries(30), 1)
-        retry = self.store.claim_delivery()
-        self.assertEqual(retry["id"], delivery["id"])
-        self.assertEqual(retry["attempts"], 1)
+        self.assertIsNone(self.store.claim_delivery())
+        failed = self.store.failed_items()["deliveries"]
+        self.assertEqual(failed[0]["id"], delivery["id"])
 
     def test_direct_reply_is_persisted_in_reliable_outbox(self):
         outbox_id = self.store.enqueue_message(["Alice"], "Schedule created")

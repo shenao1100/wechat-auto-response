@@ -60,6 +60,7 @@ class AppConfig:
     ai: AIConfig
     groups: tuple[GroupConfig, ...]
     napcat: NapCatConfig = field(default_factory=NapCatConfig)
+    direct_contexts: tuple[tuple[str, str], ...] = ()
     timezone: str = "Asia/Shanghai"
     database_path: str = "data/app.db"
     log_path: str = "logs/app.log"

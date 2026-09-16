@@ -35,6 +35,7 @@ class ConfigManager:
             "send_verify": raw.get("send_verify", True),
             "duplicate_window_hours": raw.get("duplicate_window_hours", 24),
             "delivery_timeout_seconds": raw.get("delivery_timeout_seconds", 30),
+            "direct_contexts": raw.get("direct_contexts") or {},
             "napcat": {
                 "enabled": bool(napcat.get("enabled", False)),
                 "websocket_url": napcat.get("websocket_url", "ws://127.0.0.1:3001"),

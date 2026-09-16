@@ -214,21 +214,33 @@ class HybridGateway:
         self.napcat = NapCatClient(config, self._on_private_message)
         self._direct_callback: Callable[[str, dict[str, Any]], None] | None = None
         self._targets: tuple[str, ...] = ()
+        self._wechat_targets: tuple[str, ...] = ()
+        self._qq_targets: tuple[str, ...] = ()
 
     def start(self, groups: tuple[GroupConfig, ...], callback: Callable[..., None], direct_callback: Callable[..., None] | None = None) -> None:
         self._direct_callback = direct_callback
-        self._targets = tuple(dict.fromkeys(target for group in groups if group.enabled for target in group.forward_to))
-        self.wechat.start(groups, callback, direct_callback if not self.napcat.config.enabled else None)
-        self.napcat.start(self._targets)
+        self._set_targets(groups)
+        self.wechat.start(
+            groups,
+            callback,
+            self._on_wechat_private if direct_callback is not None else None,
+            self._wechat_targets,
+        )
+        self.napcat.start(self._qq_targets)
 
     def reconfigure(self, groups: tuple[GroupConfig, ...]) -> None:
-        self._targets = tuple(dict.fromkeys(target for group in groups if group.enabled for target in group.forward_to))
-        self.wechat.reconfigure(groups)
-        self.napcat.reconfigure(self._targets)
+        self._set_targets(groups)
+        self.wechat.reconfigure(groups, self._wechat_targets)
+        self.napcat.reconfigure(self._qq_targets)
 
     def reconfigure_napcat(self, config: NapCatConfig, groups: tuple[GroupConfig, ...]) -> None:
+        self._set_targets(groups)
+        self.napcat.reconfigure(self._qq_targets, config)
+
+    def _set_targets(self, groups: tuple[GroupConfig, ...]) -> None:
         self._targets = tuple(dict.fromkeys(target for group in groups if group.enabled for target in group.forward_to))
-        self.napcat.reconfigure(self._targets, config)
+        self._qq_targets = tuple(target for target in self._targets if target.isdecimal())
+        self._wechat_targets = tuple(target for target in self._targets if target not in self._qq_targets)
 
     def stop(self) -> None:
         self.napcat.stop()
@@ -247,7 +259,7 @@ class HybridGateway:
         return self.wechat.search_contacts(keyword)
 
     def send_text(self, target: str, text: str, verify: bool) -> bool:
-        if target.endswith("@chatroom"):
+        if target.endswith("@chatroom") or target in self._wechat_targets:
             return self.wechat.send_text(target, text, verify)
         if not self.napcat.config.enabled:
             return self.wechat.send_text(target, text, verify)
@@ -255,4 +267,10 @@ class HybridGateway:
 
     def _on_private_message(self, target: str, message: dict[str, Any]) -> None:
         if self._direct_callback is not None:
+            message["_channel"] = "qq"
+            self._direct_callback(target, message)
+
+    def _on_wechat_private(self, target: str, message: dict[str, Any]) -> None:
+        if self._direct_callback is not None:
+            message["_channel"] = "wechat"
             self._direct_callback(target, message)

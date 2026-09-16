@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .timeutils import get_timezone
+
 SHARED_MEMORY_SCOPE = "__shared__"
 SHARED_MEMORY_MIGRATION = "shared_memories_v1"
 
@@ -122,7 +124,8 @@ class Store:
                     targets_json TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     created_at TEXT NOT NULL,
-                    sent_at TEXT
+                    sent_at TEXT,
+                    timezone_name TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_schedules_due
                     ON schedules(status, run_at);
@@ -146,6 +149,17 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_inbox_status
                     ON inbox(status, group_id, id);
+                CREATE TABLE IF NOT EXISTS direct_conversation_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    context_id TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_direct_conversation_context
+                    ON direct_conversation_messages(context_id, id);
                 CREATE TABLE IF NOT EXISTS outbox (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     targets_json TEXT NOT NULL,
@@ -196,6 +210,11 @@ class Store:
             }
             if "sending_at" not in delivery_columns:
                 connection.execute("ALTER TABLE outbox_deliveries ADD COLUMN sending_at TEXT")
+            schedule_columns = {
+                str(row["name"]) for row in connection.execute("PRAGMA table_info(schedules)").fetchall()
+            }
+            if "timezone_name" not in schedule_columns:
+                connection.execute("ALTER TABLE schedules ADD COLUMN timezone_name TEXT NOT NULL DEFAULT ''")
             orphaned = connection.execute(
                 """SELECT o.id, o.targets_json, o.status, o.sent_at, o.last_error FROM outbox o
                    WHERE NOT EXISTS (
@@ -268,6 +287,21 @@ class Store:
             (SHARED_MEMORY_SCOPE, now),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_direct_message(self, context_id: str, channel: str, target: str, direction: str, content: str) -> None:
+        self._connection().execute(
+            """INSERT INTO direct_conversation_messages
+               (context_id, channel, target, direction, content, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
+            (context_id, channel, target, direction, content, iso_utc()),
+        )
+
+    def recent_direct_messages(self, context_id: str, limit: int = 30) -> list[dict[str, Any]]:
+        rows = self._connection().execute(
+            """SELECT channel, target, direction, content, created_at
+               FROM direct_conversation_messages WHERE context_id=? ORDER BY id DESC LIMIT ?""",
+            (context_id, max(1, limit)),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
 
     def remember(self, _group_id: str, key: str, value: str, expires_at: str | None = None) -> None:
         self._connection().execute(
@@ -677,10 +711,15 @@ class Store:
     def recover_outbox(self) -> int:
         with self.transaction() as connection:
             deliveries = connection.execute(
-                "UPDATE outbox_deliveries SET status='pending', sending_at=NULL WHERE status='sending'"
+                """UPDATE outbox_deliveries
+                   SET status='failed', sending_at=NULL,
+                       last_error='service restarted while sending; outcome may be complete and will not be retried automatically'
+                   WHERE status='sending'"""
             ).rowcount
             outboxes = connection.execute(
-                "UPDATE outbox SET status='pending' WHERE status='sending'"
+                """UPDATE outbox SET status='failed',
+                       last_error='service restarted while sending; outcome may be complete and will not be retried automatically'
+                   WHERE status='sending'"""
             ).rowcount
         return deliveries + outboxes
 
@@ -780,19 +819,19 @@ class Store:
                 return 0
             connection.execute(
                 """UPDATE outbox_deliveries
-                   SET status='pending', sending_at=NULL,
+                   SET status='failed', sending_at=NULL,
                        last_error=?
                    WHERE status='sending' AND sending_at IS NOT NULL AND sending_at<=?""",
-                (f"sending state timed out after {timeout_seconds:g}s; queued for retry", cutoff),
+                (f"sending state timed out after {timeout_seconds:g}s; outcome may be complete and will not be retried automatically", cutoff),
             )
             for row in rows:
                 connection.execute(
-                    "UPDATE outbox SET status='pending', sent_at=NULL, last_error=? WHERE id=? AND status='sending'",
-                    (f"delivery sending state timed out after {timeout_seconds:g}s", int(row["outbox_id"])),
+                    "UPDATE outbox SET status='failed', sent_at=NULL, last_error=? WHERE id=? AND status='sending'",
+                    (f"delivery sending state timed out after {timeout_seconds:g}s; outcome may be complete and will not be retried automatically", int(row["outbox_id"])),
                 )
         return len(rows)
 
-    def queue_schedule_outbox(self, limit: int = 20) -> list[int]:
+    def queue_schedule_outbox(self, limit: int = 20, default_timezone_name: str = "UTC") -> list[int]:
         outbox_ids: list[int] = []
         with self.transaction() as connection:
             rows = connection.execute(
@@ -801,7 +840,22 @@ class Store:
                 (iso_utc(), limit),
             ).fetchall()
             for row in rows:
-                text = f"【日程提醒】\n{row['title']}\n\n{row['content']}"
+                timezone_name = str(row["timezone_name"] or default_timezone_name)
+                try:
+                    display_zone = get_timezone(timezone_name)
+                except ValueError:
+                    display_zone = timezone.utc
+                    timezone_name = "UTC"
+                scheduled_at = datetime.fromisoformat(str(row["run_at"]).replace("Z", "+00:00"))
+                if scheduled_at.tzinfo is None:
+                    scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+                display_time = scheduled_at.astimezone(display_zone).strftime("%Y-%m-%d %H:%M")
+                text = (
+                    f"【日程提醒 #{row['id']}】\n"
+                    f"{row['title']}\n"
+                    f"提醒时间：{display_time} ({timezone_name})\n\n"
+                    f"{row['content']}"
+                )
                 cursor = connection.execute(
                     """INSERT INTO outbox(targets_json, text, schedule_id, created_at)
                        VALUES (?, ?, ?, ?)""",
@@ -877,29 +931,71 @@ class Store:
         content: str,
         run_at: str,
         targets: list[str],
+        timezone_name: str = "UTC",
     ) -> int:
         cursor = self._connection().execute(
-            """INSERT INTO schedules(group_id, title, content, run_at, targets_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (group_id, title, content, run_at, json.dumps(targets, ensure_ascii=False), iso_utc()),
+            """INSERT INTO schedules(group_id, title, content, run_at, targets_json, created_at, timezone_name)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (group_id, title, content, run_at, json.dumps(targets, ensure_ascii=False), iso_utc(), timezone_name),
         )
         return int(cursor.lastrowid)
 
-    def find_schedule(self, _group_id: str, title: str, content: str, run_at: str) -> int | None:
+    def find_schedule(
+        self,
+        _group_id: str,
+        title: str,
+        content: str,
+        run_at: str,
+        exclude_id: int | None = None,
+    ) -> int | None:
+        sql = """SELECT id FROM schedules
+                 WHERE title=? AND content=? AND run_at=? AND status!='cancelled'"""
+        params: list[Any] = [title, content, run_at]
+        if exclude_id is not None:
+            sql += " AND id!=?"
+            params.append(exclude_id)
+        sql += " ORDER BY id DESC LIMIT 1"
         row = self._connection().execute(
-            """SELECT id FROM schedules
-               WHERE title=? AND content=? AND run_at=? AND status!='cancelled'
-               ORDER BY id DESC LIMIT 1""",
-            (title, content, run_at),
+            sql,
+            params,
         ).fetchone()
         return int(row["id"]) if row else None
 
-    def list_schedules(self, _group_id: str | None = None, include_done: bool = False) -> list[dict[str, Any]]:
+    def get_schedule(self, schedule_id: int) -> dict[str, Any] | None:
+        row = self._connection().execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+        return dict(row) if row else None
+
+    def update_schedule(
+        self,
+        schedule_id: int,
+        title: str,
+        content: str,
+        run_at: str,
+        timezone_name: str,
+    ) -> bool:
+        cursor = self._connection().execute(
+            """UPDATE schedules SET title=?, content=?, run_at=?, timezone_name=?
+               WHERE id=? AND status='pending'""",
+            (title, content, run_at, timezone_name, schedule_id),
+        )
+        return cursor.rowcount == 1
+
+    def list_schedules(
+        self,
+        _group_id: str | None = None,
+        include_done: bool = False,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
         sql = "SELECT * FROM schedules WHERE 1=1"
         params: list[Any] = []
-        if not include_done:
+        if status is not None:
+            sql += " AND status=?"
+            params.append(status)
+        elif not include_done:
             sql += " AND status IN ('pending', 'sending')"
-        sql += " ORDER BY run_at ASC LIMIT 100"
+        sql += " ORDER BY run_at ASC LIMIT ?"
+        params.append(max(1, min(500, int(limit))))
         rows = self._connection().execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
